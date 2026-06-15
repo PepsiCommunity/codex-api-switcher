@@ -13,7 +13,6 @@ The script is meant to live next to Codex Desktop config files in `%USERPROFILE%
 - Switches API gateway models and writes a Codex model catalog.
 - Refreshes API model catalog metadata for context window and image input.
 - Tests API gateways with text requests and the current gateway with a tiny image.
-- Can write experimental API FAST tier catalog/config metadata.
 - Creates backups before write actions and rolls back on failure where possible.
 - Refuses write actions while `Codex.exe` or `codex.exe` is running.
 
@@ -58,14 +57,23 @@ Write actions are disabled while Codex is running because the desktop app can lo
 1. Subscription / OpenAI account
 2. API gateway: codexcn
 3. API gateway: modelhub
-T. Test API gateways
 M. Change model
-C. Refresh API model catalog
-F. Toggle API FAST tier
-R. Restore hidden user chats
-S. Sync all chats to current active provider
+T. Tools
+D. Diagnostics
 Q. Quit
 ```
+
+Tools:
+
+```text
+T. Test API gateways
+C. Refresh API model catalog
+R. Restore hidden user chats
+S. Sync all chats to current active provider
+Q. Back
+```
+
+Diagnostics shows the current config, Codex process status, and thread provider counts.
 
 ## Modes
 
@@ -105,9 +113,9 @@ The script reads those variables at runtime.
 
 ## Chat Recovery
 
-`R. Restore hidden user chats` is the safer recovery action. It updates only user-created chats whose stored provider differs from the current provider. Archived chats are optional.
+`Tools > R. Restore hidden user chats` is the safer recovery action. It updates only user-created chats whose stored provider differs from the current provider. Archived chats are optional.
 
-`S. Sync all chats to current active provider` is broader. It updates every local thread row and affected JSONL session to the active provider.
+`Tools > S. Sync all chats to current active provider` is broader. It updates every local thread row and affected JSONL session to the active provider.
 
 ## Models
 
@@ -122,7 +130,7 @@ It does not modify chat database rows.
 
 In subscription mode the script removes `model_catalog_json` so Codex Desktop can use its built-in model catalog.
 
-`C. Refresh API model catalog` rewrites the generated catalog without changing chats, provider, or model. Use it after updating this script or when Codex Desktop appears to use an unexpectedly small context or refuses image attachments in API mode.
+`Tools > C. Refresh API model catalog` rewrites the generated catalog without changing chats, provider, or model. Use it after updating this script or when Codex Desktop appears to use an unexpectedly small context or refuses image attachments in API mode.
 
 Generated API model entries are written for the active gateway, not for every configured gateway at once. This matters because the same model slug can exist behind multiple gateways with different limits.
 
@@ -146,39 +154,12 @@ The actual usable context and image support still depend on the selected gateway
 
 ## API Tests
 
-`T. Test API gateways` can send:
+`Tools > T. Test API gateways` can send:
 
 - Text-only `/responses` requests to one or all configured gateways.
 - A tiny generated PNG image to the current API gateway through `/responses`.
 
 The test prints HTTP status and a short response body. It never prints API keys.
-
-## API FAST Tier
-
-`F. Toggle API FAST tier` updates the generated model catalog so API gateway models advertise FAST metadata:
-
-```json
-"additional_speed_tiers": ["fast"],
-"service_tiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"}]
-```
-
-When enabled, it also writes:
-
-```toml
-service_tier = "priority"
-```
-
-When disabled, it writes `service_tier = "default"`.
-
-Important: current Codex Desktop builds gate FAST behind ChatGPT subscription auth. In pure API gateway mode (`requires_openai_auth = false`), Desktop hides the FAST UI and sends `serviceTier = null` for turns, even when this catalog/config metadata exists.
-
-This toggle is kept as an experimental and reversible config option for future Desktop builds, CLI behavior, or manual testing. It is not a pure API Desktop UI unlock.
-
-The toggle state is stored locally in:
-
-```text
-%USERPROFILE%\.codex\codex_provider_menu_state.json
-```
 
 ## Backups
 

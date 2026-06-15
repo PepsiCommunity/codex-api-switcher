@@ -185,12 +185,6 @@ if not DB_PATH.exists():
     DB_PATH = CODEX_HOME / "state_5.sqlite"
 SESSION_INDEX_PATH = CODEX_HOME / "session_index.jsonl"
 MODEL_CATALOG_PATH = CODEX_HOME / "codex_provider_models.json"
-MENU_STATE_PATH = CODEX_HOME / "codex_provider_menu_state.json"
-FAST_SERVICE_TIER = {
-    "id": "priority",
-    "name": "Fast",
-    "description": "1.5x speed, increased usage",
-}
 
 
 def clear_screen() -> None:
@@ -398,7 +392,6 @@ def parse_config_status() -> dict[str, Any]:
     status = {
         "model_provider": "",
         "model": "",
-        "service_tier": "",
         "model_catalog_json": "",
         "providers": {},
     }
@@ -420,9 +413,6 @@ def parse_config_status() -> dict[str, Any]:
             match = re.match(r'^model\s*=\s*["\']([^"\']+)["\']', stripped)
             if match:
                 status["model"] = match.group(1)
-            match = re.match(r'^service_tier\s*=\s*["\']([^"\']+)["\']', stripped)
-            if match:
-                status["service_tier"] = match.group(1)
             match = re.match(r'^model_catalog_json\s*=\s*["\']([^"\']+)["\']', stripped)
             if match:
                 status["model_catalog_json"] = match.group(1)
@@ -509,80 +499,6 @@ def all_gateway_models() -> list[str]:
     return models
 
 
-def read_menu_state() -> dict[str, Any]:
-    if not MENU_STATE_PATH.exists():
-        return {}
-    try:
-        data = json.loads(MENU_STATE_PATH.read_text(encoding="utf-8", errors="strict"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def write_menu_state(values: dict[str, Any]) -> None:
-    state = read_menu_state()
-    state.update(values)
-    atomic_write_text(MENU_STATE_PATH, json.dumps(state, indent=2, sort_keys=True) + "\n")
-
-
-def infer_api_fast_ui_enabled_from_catalog() -> bool:
-    if not MODEL_CATALOG_PATH.exists():
-        return False
-    try:
-        catalog = json.loads(MODEL_CATALOG_PATH.read_text(encoding="utf-8", errors="strict"))
-    except Exception:
-        return False
-
-    known_models = set(all_gateway_models())
-    entries = [
-        model
-        for model in catalog.get("models", [])
-        if isinstance(model, dict) and model.get("slug") in known_models
-    ]
-    if not entries:
-        return False
-    return all("fast" in (entry.get("additional_speed_tiers") or []) for entry in entries)
-
-
-def api_fast_ui_enabled() -> bool:
-    value = read_menu_state().get("api_fast_ui_enabled")
-    if isinstance(value, bool):
-        return value
-    return infer_api_fast_ui_enabled_from_catalog()
-
-
-def current_service_tier(status: dict[str, Any] | None = None) -> str:
-    if status is None:
-        status = parse_config_status()
-    tier = status.get("service_tier")
-    return str(tier) if tier else "default"
-
-
-def is_pure_api_desktop_mode(status: dict[str, Any] | None = None) -> bool:
-    if status is None:
-        status = parse_config_status()
-    provider = active_provider_config(status)
-    return status.get("model_provider") == "custom" and provider.get("requires_openai_auth") is False
-
-
-def api_fast_effective_enabled(status: dict[str, Any] | None = None) -> bool:
-    return api_fast_ui_enabled() and current_service_tier(status) == FAST_SERVICE_TIER["id"]
-
-
-def api_fast_state_label(status: dict[str, Any] | None = None) -> str:
-    if status is None:
-        status = parse_config_status()
-    catalog_enabled = api_fast_ui_enabled()
-    tier = current_service_tier(status)
-    if catalog_enabled and tier == FAST_SERVICE_TIER["id"]:
-        if is_pure_api_desktop_mode(status):
-            return "configured (Desktop pure API ignores)"
-        return "enabled"
-    if catalog_enabled:
-        return f"partial: catalog enabled, service_tier={tier}"
-    return "disabled"
-
-
 def models_for_active_profile(status: dict[str, Any]) -> tuple[str, list[str]]:
     profile = active_profile(status)
     if not profile or profile.kind != "api":
@@ -617,22 +533,9 @@ def context_window_for_gateway(gateway_id: str) -> int:
     return GATEWAY_CONTEXT_WINDOWS.get(gateway_id, DEFAULT_MODEL_CONTEXT_WINDOW)
 
 
-def additional_speed_tiers_for_model(model: str, enable_api_fast_ui: bool) -> list[str]:
-    if enable_api_fast_ui or model.endswith("-fast"):
-        return ["fast"]
-    return []
-
-
-def service_tiers_for_model(enable_api_fast_ui: bool) -> list[dict[str, str]]:
-    if enable_api_fast_ui:
-        return [dict(FAST_SERVICE_TIER)]
-    return []
-
-
 def model_catalog_entry(
     model: str,
     priority: int,
-    enable_api_fast_ui: bool,
     gateway_id: str,
 ) -> dict[str, Any]:
     context_window = context_window_for_gateway(gateway_id)
@@ -651,8 +554,8 @@ def model_catalog_entry(
         "visibility": "list",
         "supported_in_api": True,
         "priority": priority,
-        "additional_speed_tiers": additional_speed_tiers_for_model(model, enable_api_fast_ui),
-        "service_tiers": service_tiers_for_model(enable_api_fast_ui),
+        "additional_speed_tiers": [],
+        "service_tiers": [],
         "availability_nux": None,
         "upgrade": None,
         "base_instructions": "You are Codex, a coding agent.",
@@ -679,19 +582,13 @@ def model_catalog_entry(
     }
 
 
-def build_model_catalog(
-    enable_api_fast_ui: bool | None = None,
-    gateway_id: str | None = None,
-) -> dict[str, Any]:
-    if enable_api_fast_ui is None:
-        enable_api_fast_ui = api_fast_ui_enabled()
+def build_model_catalog(gateway_id: str | None = None) -> dict[str, Any]:
     resolved_gateway_id = resolve_catalog_gateway_id(gateway_id)
     return {
         "models": [
             model_catalog_entry(
                 model,
                 priority=100 + index,
-                enable_api_fast_ui=enable_api_fast_ui,
                 gateway_id=resolved_gateway_id,
             )
             for index, model in enumerate(models_for_catalog_gateway(resolved_gateway_id))
@@ -699,12 +596,9 @@ def build_model_catalog(
     }
 
 
-def write_model_catalog(
-    enable_api_fast_ui: bool | None = None,
-    gateway_id: str | None = None,
-) -> None:
+def write_model_catalog(gateway_id: str | None = None) -> None:
     content = json.dumps(
-        build_model_catalog(enable_api_fast_ui=enable_api_fast_ui, gateway_id=gateway_id),
+        build_model_catalog(gateway_id=gateway_id),
         ensure_ascii=False,
         indent=2,
     ) + "\n"
@@ -715,6 +609,7 @@ def update_config_model(model: str) -> None:
     lines = read_config_lines()
     lines = set_top_level_value(lines, "model", model)
     lines = set_top_level_value(lines, "model_catalog_json", str(MODEL_CATALOG_PATH))
+    lines = remove_top_level_value(lines, "service_tier")
     atomic_write_text(CONFIG_PATH, "\n".join(lines) + "\n")
 
 
@@ -1029,6 +924,7 @@ def sync_session_index() -> tuple[int, int]:
 def build_config_for_profile(profile: Profile) -> str:
     lines = read_config_lines()
     lines = set_top_level_value(lines, "model_provider", profile.provider)
+    lines = remove_top_level_value(lines, "service_tier")
     if profile.kind == "api":
         lines = set_top_level_value(lines, "model_catalog_json", str(MODEL_CATALOG_PATH))
         if not (profile.name and profile.base_url and profile.env_key):
@@ -1037,11 +933,6 @@ def build_config_for_profile(profile: Profile) -> str:
         available_models = GATEWAY_MODELS.get(profile.id, [])
         if current_model not in available_models:
             lines = set_top_level_value(lines, "model", "gpt-5.5")
-        lines = set_top_level_value(
-            lines,
-            "service_tier",
-            FAST_SERVICE_TIER["id"] if api_fast_ui_enabled() else "default",
-        )
         lines = upsert_section_values(
             lines,
             "model_providers.custom",
@@ -1182,67 +1073,20 @@ def backup_model_settings() -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_dir = CODEX_HOME / f"backup-{stamp}-provider-menu-model"
     backup_dir.mkdir(parents=False, exist_ok=False)
-    for path in [CONFIG_PATH, MODEL_CATALOG_PATH, MENU_STATE_PATH]:
+    for path in [CONFIG_PATH, MODEL_CATALOG_PATH]:
         if path.exists():
             shutil.copy2(path, backup_dir / path.name)
     return backup_dir
 
 
 def restore_model_settings(backup_dir: Path) -> None:
-    for name in ["config.toml", "codex_provider_models.json", "codex_provider_menu_state.json"]:
+    for name in ["config.toml", "codex_provider_models.json"]:
         src = backup_dir / name
         dest = CODEX_HOME / name
         if src.exists():
             shutil.copy2(src, dest)
         elif dest.exists():
             dest.unlink()
-
-
-def set_api_fast_ui_enabled(enabled: bool) -> None:
-    assert_codex_not_running_for_writes()
-    if not CONFIG_PATH.exists():
-        raise ProviderMenuError(f"Missing config: {CONFIG_PATH}")
-
-    status = parse_config_status()
-    if status.get("model_provider") != "custom":
-        raise ProviderMenuError("Switch to an API gateway profile before changing API FAST tier.")
-    gateway_id, _ = models_for_active_profile(status)
-    if not gateway_id:
-        raise ProviderMenuError("Current API gateway is not one of the configured TUI profiles.")
-
-    backup_dir = backup_model_settings()
-    print(f"Backup: {backup_dir}")
-
-    try:
-        write_menu_state({"api_fast_ui_enabled": enabled})
-        write_model_catalog(enable_api_fast_ui=enabled, gateway_id=gateway_id)
-        lines = read_config_lines()
-        lines = set_top_level_value(lines, "model_catalog_json", str(MODEL_CATALOG_PATH))
-        lines = set_top_level_value(
-            lines,
-            "service_tier",
-            FAST_SERVICE_TIER["id"] if enabled else "default",
-        )
-        atomic_write_text(CONFIG_PATH, "\n".join(lines) + "\n")
-    except Exception:
-        print("FAST tier switch failed. Restoring backup...")
-        try:
-            restore_model_settings(backup_dir)
-            print("Rollback completed.")
-        except Exception as rollback_error:
-            print(f"Rollback failed: {rollback_error}")
-            print(f"Manual backup: {backup_dir}")
-        raise
-
-    print("API FAST tier updated.")
-    print(f"FAST tier config: {'enabled' if enabled else 'disabled'}")
-    print(f"Service tier: {FAST_SERVICE_TIER['id'] if enabled else 'default'}")
-    print(f"Catalog gateway: {gateway_id}")
-    print(f"Model catalog: {MODEL_CATALOG_PATH}")
-    if enabled:
-        print("Note: current Codex Desktop hides and ignores FAST for pure API mode.")
-        print("It only enables FAST UI/request tier for ChatGPT subscription auth.")
-    print("Restart Codex Desktop before checking the model picker.")
 
 
 def apply_model(model: str) -> None:
@@ -1296,6 +1140,7 @@ def refresh_model_catalog() -> None:
         write_model_catalog(gateway_id=gateway_id)
         lines = read_config_lines()
         lines = set_top_level_value(lines, "model_catalog_json", str(MODEL_CATALOG_PATH))
+        lines = remove_top_level_value(lines, "service_tier")
         atomic_write_text(CONFIG_PATH, "\n".join(lines) + "\n")
     except Exception:
         print("Catalog refresh failed. Restoring backup...")
@@ -1335,7 +1180,7 @@ def provider_counts() -> list[tuple[str, str, int, int]]:
         conn.close()
 
 
-def show_status() -> None:
+def show_status(include_thread_providers: bool = False) -> None:
     clear_screen()
     print(color(APP_TITLE, Style.CYAN, Style.BOLD))
     print(f"{color('Codex home:', Style.DIM)} {CODEX_HOME}")
@@ -1351,21 +1196,20 @@ def show_status() -> None:
         print(f"  provider url:   {provider.get('base_url', '')}")
         print(f"  provider env:   {provider.get('env_key', '')}")
         print(f"  auth mode:      {auth_mode_label(provider.get('requires_openai_auth'))}")
-        print(f"  service tier:   {current_service_tier(status)}")
         print(f"  model catalog:  {status.get('model_catalog_json', '')}")
-        print(f"  API FAST tier:  {api_fast_state_label(status)}")
     else:
         print(color(f"config.toml not found: {CONFIG_PATH}", Style.RED, Style.BOLD))
     print()
 
-    counts = provider_counts()
-    if counts:
-        print(color("Thread providers:", Style.BOLD))
-        for provider, source, archived, count in counts:
-            print(f"  provider={provider!r} source={source!r} archived={archived}: {count}")
-    else:
-        print(color("Thread providers: unavailable", Style.YELLOW))
-    print()
+    if include_thread_providers:
+        counts = provider_counts()
+        if counts:
+            print(color("Thread providers:", Style.BOLD))
+            for provider, source, archived, count in counts:
+                print(f"  provider={provider!r} source={source!r} archived={archived}: {count}")
+        else:
+            print(color("Thread providers: unavailable", Style.YELLOW))
+        print()
 
     processes = list_codex_processes()
     if processes and is_real_codex_home():
@@ -1748,10 +1592,6 @@ def change_model_menu() -> None:
         print("This changes only model and model_catalog_json in config.toml.")
         print("Codex Desktop must be closed before applying.")
         print()
-        if not confirm("Apply now?", default=False):
-            print(color("Cancelled.", Style.YELLOW))
-            pause()
-            continue
         try:
             apply_model(selected)
         except Exception as exc:
@@ -1778,45 +1618,8 @@ def refresh_model_catalog_menu() -> None:
     print(f"Input modalities will be: {', '.join(MODEL_INPUT_MODALITIES)}.")
     print("Codex Desktop must be closed before applying.")
     print()
-    if not confirm("Refresh now?", default=False):
-        print(color("Cancelled.", Style.YELLOW))
-        pause()
-        return
     try:
         refresh_model_catalog()
-    except Exception as exc:
-        print()
-        print(f"ERROR: {exc}")
-    print()
-    pause()
-
-
-def toggle_api_fast_ui_menu() -> None:
-    clear_screen()
-    status = parse_config_status()
-    current = api_fast_effective_enabled(status)
-    target = not current
-
-    print(color("Toggle API FAST tier", Style.CYAN, Style.BOLD))
-    print()
-    print(f"Current provider: {status.get('model_provider') or 'unknown'}")
-    print(f"Current model:    {status.get('model') or 'unknown'}")
-    print(f"Current state:    {api_fast_state_label(status)}")
-    print(f"Target state:     {'enabled' if target else 'disabled'}")
-    print()
-    print("This changes the generated API model catalog, menu state, and service_tier.")
-    print("Current Codex Desktop builds gate FAST behind ChatGPT subscription auth.")
-    print("In pure API mode, Desktop hides the FAST UI and sends serviceTier=null.")
-    print(f"When enabled, service_tier is set to {FAST_SERVICE_TIER['id']!r}.")
-    print("Keep this as an experimental/reversible config toggle, not a Desktop UI unlock.")
-    print("Codex Desktop must be closed before applying.")
-    print()
-    if not confirm("Apply now?", default=False):
-        print(color("Cancelled.", Style.YELLOW))
-        pause()
-        return
-    try:
-        set_api_fast_ui_enabled(target)
     except Exception as exc:
         print()
         print(f"ERROR: {exc}")
@@ -1836,11 +1639,6 @@ def apply_profile_menu(profile: Profile) -> None:
     print("This will make all local chats visible under the selected provider.")
     print("Codex Desktop must be closed before applying.")
     print()
-    if not confirm("Apply now?", default=False):
-        print(color("Cancelled.", Style.YELLOW))
-        pause()
-        return
-
     try:
         apply_profile(profile)
     except Exception as exc:
@@ -1932,20 +1730,16 @@ def restore_hidden_chats_menu() -> None:
     pause()
 
 
-def main_menu() -> None:
+def tools_menu() -> None:
     while True:
-        show_status()
-        status = parse_config_status() if CONFIG_PATH.exists() else {}
-        print(color("Choose mode:", Style.BOLD))
-        for index, profile in enumerate(PROFILES, 1):
-            print(format_menu_item(str(index), profile.label, is_profile_active(profile, status)))
+        clear_screen()
+        print(color("Tools", Style.CYAN, Style.BOLD))
+        print()
         print(format_menu_item("T", "Test API gateways"))
-        print(format_menu_item("M", "Change model"))
         print(format_menu_item("C", "Refresh API model catalog"))
-        print(format_menu_item("F", "Toggle API FAST tier"))
         print(format_menu_item("R", "Restore hidden user chats"))
         print(format_menu_item("S", "Sync all chats to current active provider"))
-        print(format_menu_item("Q", "Quit"))
+        print(format_menu_item("Q", "Back"))
         print()
         choice = input("Select: ").strip().lower()
         if choice == "q":
@@ -1953,20 +1747,47 @@ def main_menu() -> None:
         if choice == "t":
             test_apis_menu()
             continue
-        if choice == "m":
-            change_model_menu()
-            continue
         if choice == "c":
             refresh_model_catalog_menu()
             continue
-        if choice == "f":
-            toggle_api_fast_ui_menu()
+        if choice == "r":
+            restore_hidden_chats_menu()
             continue
         if choice == "s":
             sync_current_menu()
             continue
-        if choice == "r":
-            restore_hidden_chats_menu()
+        print("Invalid choice.")
+        time.sleep(1)
+
+
+def diagnostics_menu() -> None:
+    show_status(include_thread_providers=True)
+    pause()
+
+
+def main_menu() -> None:
+    while True:
+        show_status()
+        status = parse_config_status() if CONFIG_PATH.exists() else {}
+        print(color("Choose mode:", Style.BOLD))
+        for index, profile in enumerate(PROFILES, 1):
+            print(format_menu_item(str(index), profile.label, is_profile_active(profile, status)))
+        print(format_menu_item("M", "Change model"))
+        print(format_menu_item("T", "Tools"))
+        print(format_menu_item("D", "Diagnostics"))
+        print(format_menu_item("Q", "Quit"))
+        print()
+        choice = input("Select: ").strip().lower()
+        if choice == "q":
+            return
+        if choice == "t":
+            tools_menu()
+            continue
+        if choice == "m":
+            change_model_menu()
+            continue
+        if choice == "d":
+            diagnostics_menu()
             continue
         try:
             profile = PROFILES[int(choice) - 1]
