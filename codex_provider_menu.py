@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import csv
+import getpass
 import io
 import json
 import os
@@ -43,6 +44,11 @@ APP_TITLE = "Codex Provider Menu"
 TECHNICAL_TITLE_PREFIX = (
     "The following is the Codex agent history whose request action you are assessing"
 )
+DEFAULT_MODEL_CONTEXT_WINDOW = 128000
+MODEL_INPUT_MODALITIES = ["text", "image"]
+MODEL_EXCLUDE_FROM_AGENT_MENU = {"gpt-image-2"}
+API_CONFIG_VERSION = 1
+API_TEST_USER_AGENT = "Codex Provider Menu/1.0"
 
 
 class Style:
@@ -87,77 +93,18 @@ class Profile:
     name: str | None = None
     base_url: str | None = None
     env_key: str | None = None
+    models: tuple[str, ...] = ()
+    default_model: str = ""
+    context_window: int = DEFAULT_MODEL_CONTEXT_WINDOW
+    input_modalities: tuple[str, ...] = ("text", "image")
 
 
-PROFILES: list[Profile] = [
-    Profile(
-        id="subscription",
-        label="Subscription / OpenAI account",
-        provider="openai",
-        kind="subscription",
-    ),
-    Profile(
-        id="codexcn",
-        label="API gateway: codexcn",
-        provider="custom",
-        kind="api",
-        name="codexcn",
-        base_url="https://codexcn.top/ai/v1",
-        env_key="CODEXCN_API_KEY",
-    ),
-    Profile(
-        id="modelhub",
-        label="API gateway: modelhub",
-        provider="custom",
-        kind="api",
-        name="modelhub",
-        base_url="https://modelhub.my/v1",
-        env_key="MODELHUB_API_KEY",
-    ),
-]
-
-
-GATEWAY_MODELS: dict[str, list[str]] = {
-    "codexcn": [
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.5",
-        "MiniMax-M2.7",
-        "MiniMax-M2.7-highspeed",
-        "MiniMax-M3",
-    ],
-    "modelhub": [
-        "claude-haiku-4-5",
-        "claude-opus-4-6",
-        "claude-opus-4-7",
-        "claude-opus-4-7-fast",
-        "claude-opus-4-8",
-        "claude-sonnet-4-6",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "glm-5.1",
-        "gpt-5.3-codex-spark",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-        "gpt-5.5",
-        "gpt-5.5-xhigh-fast",
-        "kimi-k2.5",
-        "kimi-k2.6",
-        "kimi-k2.7-code",
-        "qwen3.6-plus",
-    ],
-}
-
-MODEL_EXCLUDE_FROM_AGENT_MENU = {"gpt-image-2"}
-GATEWAY_CONTEXT_WINDOWS = {
-    "codexcn": 128000,
-    "modelhub": 400000,
-}
-DEFAULT_MODEL_CONTEXT_WINDOW = 128000
-MODEL_INPUT_MODALITIES = ["text", "image"]
-API_TEST_USER_AGENT = "Codex Provider Menu/1.0"
+SUBSCRIPTION_PROFILE = Profile(
+    id="subscription",
+    label="Subscription / OpenAI account",
+    provider="openai",
+    kind="subscription",
+)
 
 
 class ProviderMenuError(RuntimeError):
@@ -185,6 +132,7 @@ if not DB_PATH.exists():
     DB_PATH = CODEX_HOME / "state_5.sqlite"
 SESSION_INDEX_PATH = CODEX_HOME / "session_index.jsonl"
 MODEL_CATALOG_PATH = CODEX_HOME / "codex_provider_models.json"
+API_CONFIG_PATH = CODEX_HOME / "codex_switcher_apis.json"
 
 
 def clear_screen() -> None:
@@ -378,6 +326,136 @@ def atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def api_config_template() -> dict[str, Any]:
+    return {
+        "version": API_CONFIG_VERSION,
+        "gateways": [],
+    }
+
+
+def ensure_api_config_file() -> None:
+    if not API_CONFIG_PATH.exists():
+        atomic_write_text(API_CONFIG_PATH, json.dumps(api_config_template(), indent=2) + "\n")
+
+
+def read_api_config() -> dict[str, Any]:
+    if not API_CONFIG_PATH.exists():
+        return api_config_template()
+    try:
+        data = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8", errors="strict"))
+    except Exception as exc:
+        raise ProviderMenuError(f"Cannot read API config {API_CONFIG_PATH}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ProviderMenuError(f"API config must be a JSON object: {API_CONFIG_PATH}")
+    gateways = data.get("gateways")
+    if gateways is None:
+        data["gateways"] = []
+    elif not isinstance(gateways, list):
+        raise ProviderMenuError(f"API config field 'gateways' must be a list: {API_CONFIG_PATH}")
+    return data
+
+
+def write_api_config(data: dict[str, Any]) -> None:
+    data = dict(data)
+    data["version"] = API_CONFIG_VERSION
+    data.setdefault("gateways", [])
+    atomic_write_text(API_CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def unique_strings(values: Any) -> tuple[str, ...]:
+    if not isinstance(values, list):
+        return ()
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        output.append(text)
+        seen.add(text)
+    return tuple(output)
+
+
+def normalize_gateway_id(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_-]+", "-", value.strip().lower())
+    normalized = re.sub(r"-+", "-", normalized).strip("-_")
+    return normalized
+
+
+def default_env_key(gateway_id: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "_", gateway_id).strip("_").upper()
+    return f"{token or 'GATEWAY'}_API_KEY"
+
+
+def gateway_profile_from_config(item: Any, index: int) -> Profile:
+    if not isinstance(item, dict):
+        raise ProviderMenuError(f"API gateway #{index} must be a JSON object")
+    gateway_id = normalize_gateway_id(str(item.get("id") or item.get("name") or ""))
+    name = str(item.get("name") or gateway_id).strip()
+    base_url = str(item.get("base_url") or "").strip().rstrip("/")
+    env_key = str(item.get("env_key") or "").strip()
+    if not gateway_id:
+        raise ProviderMenuError(f"API gateway #{index} is missing id")
+    if not base_url:
+        raise ProviderMenuError(f"API gateway {gateway_id!r} is missing base_url")
+    if not env_key:
+        raise ProviderMenuError(f"API gateway {gateway_id!r} is missing env_key")
+
+    try:
+        context_window = int(item.get("context_window") or DEFAULT_MODEL_CONTEXT_WINDOW)
+    except (TypeError, ValueError):
+        context_window = DEFAULT_MODEL_CONTEXT_WINDOW
+    if context_window <= 0:
+        context_window = DEFAULT_MODEL_CONTEXT_WINDOW
+
+    models = tuple(model for model in unique_strings(item.get("models")) if model not in MODEL_EXCLUDE_FROM_AGENT_MENU)
+    default_model = str(item.get("default_model") or "").strip()
+    if default_model and default_model not in models:
+        models = (default_model, *models)
+
+    input_modalities = unique_strings(item.get("input_modalities")) or tuple(MODEL_INPUT_MODALITIES)
+    label = str(item.get("label") or f"API gateway: {name}").strip()
+    return Profile(
+        id=gateway_id,
+        label=label,
+        provider="custom",
+        kind="api",
+        name=name,
+        base_url=base_url,
+        env_key=env_key,
+        models=models,
+        default_model=default_model,
+        context_window=context_window,
+        input_modalities=input_modalities,
+    )
+
+
+def api_profiles() -> list[Profile]:
+    config = read_api_config()
+    output: list[Profile] = []
+    seen: set[str] = set()
+    for index, item in enumerate(config.get("gateways", []), 1):
+        profile = gateway_profile_from_config(item, index)
+        if profile.id in seen:
+            raise ProviderMenuError(f"Duplicate API gateway id in {API_CONFIG_PATH}: {profile.id}")
+        output.append(profile)
+        seen.add(profile.id)
+    return output
+
+
+def profiles() -> list[Profile]:
+    return [SUBSCRIPTION_PROFILE, *api_profiles()]
+
+
+def api_profile_by_id(gateway_id: str) -> Profile | None:
+    for profile in api_profiles():
+        if profile.id == gateway_id:
+            return profile
+    return None
+
+
 def parse_toml_bool(value: str) -> bool | None:
     lowered = value.strip().lower()
     if lowered == "true":
@@ -437,7 +515,7 @@ def active_provider_config(status: dict[str, Any]) -> dict[str, Any]:
 
 
 def active_profile(status: dict[str, Any]) -> Profile | None:
-    for profile in PROFILES:
+    for profile in profiles():
         if is_profile_active(profile, status):
             return profile
     return None
@@ -487,62 +565,27 @@ def display_model_name(model: str) -> str:
     return model.replace("-", " ").replace("_", " ").title()
 
 
-def all_gateway_models() -> list[str]:
-    models: list[str] = []
-    seen: set[str] = set()
-    for gateway_models in GATEWAY_MODELS.values():
-        for model in gateway_models:
-            if model in MODEL_EXCLUDE_FROM_AGENT_MENU or model in seen:
-                continue
-            models.append(model)
-            seen.add(model)
-    return models
-
-
-def models_for_active_profile(status: dict[str, Any]) -> tuple[str, list[str]]:
+def models_for_active_profile(status: dict[str, Any]) -> tuple[Profile | None, list[str]]:
     profile = active_profile(status)
     if not profile or profile.kind != "api":
-        return "", []
-    return profile.id, list(GATEWAY_MODELS.get(profile.id, []))
+        return None, []
+    return profile, list(profile.models)
 
 
-def resolve_catalog_gateway_id(gateway_id: str | None = None) -> str:
-    if gateway_id:
-        return gateway_id
-    try:
-        status = parse_config_status()
-    except Exception:
-        return ""
-    profile = active_profile(status)
-    if profile and profile.kind == "api":
-        return profile.id
-    return ""
-
-
-def models_for_catalog_gateway(gateway_id: str) -> list[str]:
-    if gateway_id in GATEWAY_MODELS:
-        return [
-            model
-            for model in GATEWAY_MODELS[gateway_id]
-            if model not in MODEL_EXCLUDE_FROM_AGENT_MENU
-        ]
-    return all_gateway_models()
-
-
-def context_window_for_gateway(gateway_id: str) -> int:
-    return GATEWAY_CONTEXT_WINDOWS.get(gateway_id, DEFAULT_MODEL_CONTEXT_WINDOW)
+def models_for_catalog_profile(profile: Profile) -> list[str]:
+    return [model for model in profile.models if model not in MODEL_EXCLUDE_FROM_AGENT_MENU]
 
 
 def model_catalog_entry(
     model: str,
     priority: int,
-    gateway_id: str,
+    profile: Profile,
 ) -> dict[str, Any]:
-    context_window = context_window_for_gateway(gateway_id)
+    context_window = profile.context_window or DEFAULT_MODEL_CONTEXT_WINDOW
     return {
         "slug": model,
         "display_name": display_model_name(model),
-        "description": f"Model exposed by the configured {gateway_id or 'API'} gateway.",
+        "description": f"Model exposed by the configured {profile.name or profile.id} gateway.",
         "default_reasoning_level": "medium",
         "supported_reasoning_levels": [
             {"effort": "low", "description": "Fast responses with lighter reasoning"},
@@ -576,29 +619,28 @@ def model_catalog_entry(
         "max_context_window": context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": MODEL_INPUT_MODALITIES,
+        "input_modalities": list(profile.input_modalities or tuple(MODEL_INPUT_MODALITIES)),
         "supports_search_tool": True,
         "use_responses_lite": False,
     }
 
 
-def build_model_catalog(gateway_id: str | None = None) -> dict[str, Any]:
-    resolved_gateway_id = resolve_catalog_gateway_id(gateway_id)
+def build_model_catalog(profile: Profile) -> dict[str, Any]:
     return {
         "models": [
             model_catalog_entry(
                 model,
                 priority=100 + index,
-                gateway_id=resolved_gateway_id,
+                profile=profile,
             )
-            for index, model in enumerate(models_for_catalog_gateway(resolved_gateway_id))
+            for index, model in enumerate(models_for_catalog_profile(profile))
         ]
     }
 
 
-def write_model_catalog(gateway_id: str | None = None) -> None:
+def write_model_catalog(profile: Profile) -> None:
     content = json.dumps(
-        build_model_catalog(gateway_id=gateway_id),
+        build_model_catalog(profile),
         ensure_ascii=False,
         indent=2,
     ) + "\n"
@@ -929,10 +971,11 @@ def build_config_for_profile(profile: Profile) -> str:
         lines = set_top_level_value(lines, "model_catalog_json", str(MODEL_CATALOG_PATH))
         if not (profile.name and profile.base_url and profile.env_key):
             raise ProviderMenuError(f"API profile is incomplete: {profile.id}")
-        current_model = parse_config_status().get("model") or "gpt-5.5"
-        available_models = GATEWAY_MODELS.get(profile.id, [])
-        if current_model not in available_models:
-            lines = set_top_level_value(lines, "model", "gpt-5.5")
+        current_model = parse_config_status().get("model") or ""
+        available_models = list(profile.models)
+        fallback_model = profile.default_model or (available_models[0] if available_models else "")
+        if fallback_model and available_models and current_model not in available_models:
+            lines = set_top_level_value(lines, "model", fallback_model)
         lines = upsert_section_values(
             lines,
             "model_providers.custom",
@@ -963,6 +1006,16 @@ def get_user_env_var(name: str) -> str:
         return ""
 
 
+def set_user_env_var(name: str, value: str) -> None:
+    os.environ[name] = value
+    if os.name != "nt":
+        raise ProviderMenuError(
+            f"Saved for this process only. Persist it in your shell profile: export {name}=<key>"
+        )
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+        winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+
+
 def get_api_key(profile: Profile) -> str:
     if not profile.env_key:
         return ""
@@ -980,7 +1033,7 @@ def apply_profile(profile: Profile) -> None:
 
     try:
         if profile.kind == "api":
-            write_model_catalog(gateway_id=profile.id)
+            write_model_catalog(profile)
             if not (profile.env_key and get_api_key(profile)):
                 raise ProviderMenuError(
                     f"API key is missing. Set User environment variable: {profile.env_key}"
@@ -1091,11 +1144,11 @@ def restore_model_settings(backup_dir: Path) -> None:
 
 def apply_model(model: str) -> None:
     status = parse_config_status()
-    gateway_id, available_models = models_for_active_profile(status)
-    if not gateway_id:
+    profile, available_models = models_for_active_profile(status)
+    if not profile:
         raise ProviderMenuError("Current provider is not one of the configured TUI profiles.")
     if model not in available_models:
-        raise ProviderMenuError(f"Model {model!r} is not listed for the current gateway: {gateway_id}")
+        raise ProviderMenuError(f"Model {model!r} is not listed for the current gateway: {profile.id}")
 
     assert_codex_not_running_for_writes()
     if not CONFIG_PATH.exists():
@@ -1105,7 +1158,7 @@ def apply_model(model: str) -> None:
     print(f"Backup: {backup_dir}")
 
     try:
-        write_model_catalog(gateway_id=gateway_id)
+        write_model_catalog(profile)
         update_config_model(model)
     except Exception:
         print("Model switch failed. Restoring backup...")
@@ -1118,7 +1171,7 @@ def apply_model(model: str) -> None:
         raise
 
     print("Model updated.")
-    print(f"Current gateway: {gateway_id}")
+    print(f"Current gateway: {profile.id}")
     print(f"Active model: {model}")
     print(f"Model catalog: {MODEL_CATALOG_PATH}")
     print("Restart Codex Desktop before using the new model.")
@@ -1281,21 +1334,34 @@ def post_api_json(profile: Profile, path: str, payload: dict[str, Any], timeout:
         }
 
 
-def test_api_profile(profile: Profile, timeout: int = 30, include_image: bool = False) -> dict[str, Any]:
+def default_model_for_profile(profile: Profile) -> str:
+    return profile.default_model or (profile.models[0] if profile.models else "")
+
+
+def test_api_profile(
+    profile: Profile,
+    model: str | None = None,
+    timeout: int = 30,
+    include_image: bool = False,
+) -> dict[str, Any]:
     if profile.kind != "api":
         return {"profile": profile.id, "status": "skipped", "message": "subscription mode has no API key test"}
     assert profile.base_url
-    model = parse_config_status().get("model") or "gpt-5.5"
+    model = model or default_model_for_profile(profile)
+    if not model:
+        return {"profile": profile.id, "status": "error", "error": "No model selected or configured"}
     if not include_image:
-        return post_api_json(
+        result = post_api_json(
             profile,
             "/responses",
             {"model": model, "input": "Reply with OK only."},
             timeout,
         )
+        result["model"] = model
+        return result
 
     image_url = make_test_png_data_url()
-    return post_api_json(
+    result = post_api_json(
         profile,
         "/responses",
         {
@@ -1315,6 +1381,8 @@ def test_api_profile(profile: Profile, timeout: int = 30, include_image: bool = 
         },
         timeout,
     )
+    result["model"] = model
+    return result
 
 
 def fetch_api_models(profile: Profile, timeout: int = 30) -> dict[str, Any]:
@@ -1385,64 +1453,314 @@ def fetch_api_models(profile: Profile, timeout: int = 30) -> dict[str, Any]:
         }
 
 
+def parse_models_text(text: str) -> list[str]:
+    models: list[str] = []
+    seen: set[str] = set()
+    for item in re.split(r"[\n,]+", text):
+        model = item.strip()
+        if not model or model in seen or model in MODEL_EXCLUDE_FROM_AGENT_MENU:
+            continue
+        models.append(model)
+        seen.add(model)
+    return models
+
+
+def choose_model(models: list[str], prompt: str = "Model", default: str = "") -> str:
+    visible = models[:50]
+    for index, model in enumerate(visible, 1):
+        marker = " [default]" if model == default else ""
+        print(f"  {index}. {model}{marker}")
+    if len(models) > len(visible):
+        print(f"  ... {len(models) - len(visible)} more; type an exact model slug to use one of them")
+    if default:
+        print(f"  Enter. {default}")
+    answer = input(f"{prompt}: ").strip()
+    if not answer:
+        return default
+    if answer.isdigit():
+        index = int(answer) - 1
+        if 0 <= index < len(visible):
+            return visible[index]
+    return answer
+
+
+def prompt_secret(prompt: str) -> str:
+    if sys.stdin.isatty():
+        return getpass.getpass(prompt).strip()
+    return input(prompt).strip()
+
+
+def api_gateway_entry(
+    gateway_id: str,
+    name: str,
+    base_url: str,
+    env_key: str,
+    models: list[str],
+    default_model: str,
+    context_window: int,
+) -> dict[str, Any]:
+    return {
+        "id": gateway_id,
+        "name": name,
+        "label": f"API gateway: {name}",
+        "base_url": base_url.rstrip("/"),
+        "env_key": env_key,
+        "models": models,
+        "default_model": default_model,
+        "context_window": context_window,
+        "input_modalities": list(MODEL_INPUT_MODALITIES),
+    }
+
+
+def upsert_api_gateway(entry: dict[str, Any]) -> None:
+    config = read_api_config()
+    gateways = list(config.get("gateways", []))
+    gateway_id = normalize_gateway_id(str(entry.get("id") or ""))
+    replaced = False
+    for index, item in enumerate(gateways):
+        if isinstance(item, dict) and normalize_gateway_id(str(item.get("id") or "")) == gateway_id:
+            gateways[index] = entry
+            replaced = True
+            break
+    if not replaced:
+        gateways.append(entry)
+    config["gateways"] = gateways
+    write_api_config(config)
+
+
+def add_api_gateway_menu() -> None:
+    clear_screen()
+    print(color("Add API Gateway", Style.CYAN, Style.BOLD))
+    print()
+    print(f"Config file: {API_CONFIG_PATH}")
+    print("API keys are saved as Windows User environment variables, not in the JSON file.")
+    print()
+
+    current_provider: dict[str, Any] = {}
+    try:
+        status = parse_config_status()
+        if status.get("model_provider") == "custom":
+            current_provider = active_provider_config(status)
+    except Exception:
+        current_provider = {}
+
+    current_name = str(current_provider.get("name") or "").strip()
+    current_base_url = str(current_provider.get("base_url") or "").strip().rstrip("/")
+    current_env_key = str(current_provider.get("env_key") or "").strip()
+    default_id = normalize_gateway_id(current_name)
+
+    id_prompt = f"Gateway id [{default_id}]: " if default_id else "Gateway id (example: my-gateway): "
+    raw_id = input(id_prompt).strip() or default_id
+    gateway_id = normalize_gateway_id(raw_id)
+    if not gateway_id:
+        print("Gateway id is required.")
+        pause()
+        return
+    name = input(f"Display name [{current_name or gateway_id}]: ").strip() or current_name or gateway_id
+    base_prompt = f"Base URL ending with /v1 [{current_base_url}]: " if current_base_url else "Base URL ending with /v1: "
+    base_url = (input(base_prompt).strip() or current_base_url).rstrip("/")
+    if not base_url:
+        print("Base URL is required.")
+        pause()
+        return
+    default_key = current_env_key or default_env_key(gateway_id)
+    env_key = input(f"API key env var [{default_key}]: ").strip() or default_key
+
+    try:
+        context_text = input(f"Context window [{DEFAULT_MODEL_CONTEXT_WINDOW}]: ").strip()
+        context_window = int(context_text) if context_text else DEFAULT_MODEL_CONTEXT_WINDOW
+    except ValueError:
+        context_window = DEFAULT_MODEL_CONTEXT_WINDOW
+
+    key = prompt_secret("API key (optional, hidden, saved to User env var): ")
+    if key:
+        try:
+            set_user_env_var(env_key, key)
+            print(f"Saved API key to User env var: {env_key}")
+        except Exception as exc:
+            print(f"Could not persist API key: {exc}")
+
+    temp_profile = Profile(
+        id=gateway_id,
+        label=f"API gateway: {name}",
+        provider="custom",
+        kind="api",
+        name=name,
+        base_url=base_url,
+        env_key=env_key,
+    )
+
+    models: list[str] = []
+    if get_api_key(temp_profile):
+        ok, result = run_with_spinner(
+            f"Fetching {gateway_id} /models",
+            lambda: fetch_api_models(temp_profile),
+            timeout=35,
+        )
+        if ok and result.get("status") == "ok":
+            models = [model for model in result.get("models", []) if model not in MODEL_EXCLUDE_FROM_AGENT_MENU]
+            print(f"Fetched models: {len(models)}")
+        else:
+            print("Could not fetch /models.")
+            if ok:
+                print_api_result(result)
+            else:
+                print(result)
+
+    if not models:
+        manual = input("Models (comma-separated, required for model picker): ").strip()
+        models = parse_models_text(manual)
+    if not models:
+        print("No models were configured. Gateway was not saved.")
+        pause()
+        return
+
+    default_model = choose_model(models, prompt="Default model", default=models[0])
+    if default_model not in models:
+        models.insert(0, default_model)
+
+    upsert_api_gateway(
+        api_gateway_entry(
+            gateway_id=gateway_id,
+            name=name,
+            base_url=base_url,
+            env_key=env_key,
+            models=models,
+            default_model=default_model,
+            context_window=context_window,
+        )
+    )
+    print()
+    print(f"Saved API gateway: {gateway_id}")
+    print(f"Models stored: {len(models)}")
+    print(f"Default model: {default_model}")
+    pause()
+
+
+def open_api_config_menu() -> None:
+    ensure_api_config_file()
+    clear_screen()
+    print(color("API Gateway Config", Style.CYAN, Style.BOLD))
+    print()
+    print(f"Config file: {API_CONFIG_PATH}")
+    if os.name == "nt":
+        subprocess.Popen(["notepad", str(API_CONFIG_PATH)])
+        print("Opened in Notepad. Save the file, then return to this menu.")
+    print()
+    pause()
+
+
+def models_for_test(profile: Profile) -> list[str]:
+    ok, result = run_with_spinner(
+        f"Fetching {profile.id} /models",
+        lambda p=profile: fetch_api_models(p),
+        timeout=35,
+    )
+    if ok and result.get("status") == "ok":
+        models = [model for model in result.get("models", []) if model not in MODEL_EXCLUDE_FROM_AGENT_MENU]
+        if models:
+            return models
+    if ok:
+        print_models_result(result)
+    else:
+        print(f"{profile.id}: {result}")
+    return list(profile.models)
+
+
+def test_single_api_menu(profile: Profile) -> None:
+    clear_screen()
+    print(color(f"Test API Gateway: {profile.label}", Style.CYAN, Style.BOLD))
+    print()
+    print(f"Base URL: {profile.base_url}")
+    print(f"Env key:  {profile.env_key}")
+    print()
+    models = models_for_test(profile)
+    if not models:
+        model = input("Model slug: ").strip()
+    else:
+        model = choose_model(models, prompt="Test model", default=default_model_for_profile(profile) or models[0])
+    if not model:
+        print("No model selected.")
+        pause()
+        return
+    mode = input("Press Enter for text test, or type I for image test: ").strip().lower()
+    include_image = mode == "i"
+
+    print()
+    label = f"Testing {profile.id} / {model}"
+    ok, result = run_with_spinner(
+        label,
+        lambda p=profile, m=model, image=include_image: test_api_profile(p, model=m, include_image=image),
+        timeout=65 if include_image else 35,
+    )
+    if not ok:
+        print(f"{profile.id}: {result}")
+    else:
+        print_api_result(result)
+    print()
+    pause()
+
+
 def test_apis_menu() -> None:
     while True:
         clear_screen()
         print("API Test")
         print()
-        api_profiles = [profile for profile in PROFILES if profile.kind == "api"]
-        for index, profile in enumerate(api_profiles, 1):
-            print(f"  {index}. Test text: {profile.label}")
-        print("  I. Test current gateway with image")
-        print("  A. Test text on all API gateways")
-        print("  Q. Back")
+        gateways = api_profiles()
+        if not gateways:
+            print(f"No API gateways configured. Add one in Tools > Add API gateway.")
+            print(f"Config file: {API_CONFIG_PATH}")
+            print()
+            print("  Q. Back")
+        else:
+            for index, profile in enumerate(gateways, 1):
+                default_model = default_model_for_profile(profile)
+                suffix = f" ({default_model})" if default_model else ""
+                print(f"  {index}. Test selected model: {profile.label}{suffix}")
+            print("  A. Test default model on all gateways")
+            print("  Q. Back")
         print()
         choice = input("Select: ").strip().lower()
         if choice == "q":
             return
-        if choice == "i":
-            status = parse_config_status()
-            profile = active_profile(status)
-            if not profile or profile.kind != "api":
-                print("Current profile is not an API gateway.")
-                print()
-                pause()
-                continue
-            selected = [profile]
-            include_image = True
-        elif choice == "a":
-            selected = api_profiles
-            include_image = False
-        else:
-            try:
-                selected = [api_profiles[int(choice) - 1]]
-                include_image = False
-            except Exception:
-                print("Invalid choice.")
-                time.sleep(1)
-                continue
-
-        print()
-        for profile in selected:
-            test_label = "image" if include_image else "text"
-            label = f"Testing {profile.id} ({test_label})"
-            ok, result = run_with_spinner(
-                label,
-                lambda p=profile, image=include_image: test_api_profile(p, include_image=image),
-                timeout=65 if include_image else 35,
-            )
-            if not ok:
-                print(f"{profile.id}: {result}")
-                continue
-            print_api_result(result)
-        print()
-        pause()
+        if not gateways:
+            print("Invalid choice.")
+            time.sleep(1)
+            continue
+        if choice == "a":
+            print()
+            for profile in gateways:
+                model = default_model_for_profile(profile)
+                if not model:
+                    print(f"{profile.id}: skipped, no default model configured")
+                    continue
+                ok, result = run_with_spinner(
+                    f"Testing {profile.id} / {model}",
+                    lambda p=profile, m=model: test_api_profile(p, model=m),
+                    timeout=35,
+                )
+                if not ok:
+                    print(f"{profile.id}: {result}")
+                    continue
+                print_api_result(result)
+            print()
+            pause()
+            continue
+        try:
+            profile = gateways[int(choice) - 1]
+        except Exception:
+            print("Invalid choice.")
+            time.sleep(1)
+            continue
+        test_single_api_menu(profile)
 
 
 def print_api_result(result: dict[str, Any]) -> None:
     profile = result.get("profile")
     status = result.get("status")
     print(f"{profile}: {status}")
+    if "model" in result:
+        print(f"  model: {result['model']}")
     if "http_status" in result:
         print(f"  HTTP: {result['http_status']}")
     if "elapsed" in result:
@@ -1482,8 +1800,12 @@ def refresh_models_menu() -> None:
     clear_screen()
     print(color("Available API Models", Style.CYAN, Style.BOLD))
     print()
-    api_profiles = [profile for profile in PROFILES if profile.kind == "api"]
-    for profile in api_profiles:
+    gateways = api_profiles()
+    if not gateways:
+        print(f"No API gateways configured: {API_CONFIG_PATH}")
+        pause()
+        return
+    for profile in gateways:
         ok, result = run_with_spinner(
             f"Fetching {profile.id} /models",
             lambda p=profile: fetch_api_models(p),
@@ -1493,16 +1815,16 @@ def refresh_models_menu() -> None:
             print(f"{profile.id}: {result}")
             continue
         print_models_result(result)
-        known_models = [m for m in GATEWAY_MODELS.get(profile.id, []) if m not in MODEL_EXCLUDE_FROM_AGENT_MENU]
+        known_models = [m for m in profile.models if m not in MODEL_EXCLUDE_FROM_AGENT_MENU]
         live_models = [m for m in result.get("models", []) if m not in MODEL_EXCLUDE_FROM_AGENT_MENU]
         missing = sorted(set(live_models) - set(known_models))
         removed = sorted(set(known_models) - set(live_models))
         if missing:
-            print("  New models not in this TUI build:")
+            print("  New models not in API config:")
             for model in missing:
                 print(f"    + {model}")
         if removed:
-            print("  TUI models not returned by /models now:")
+            print("  Configured models not returned by /models now:")
             for model in removed:
                 print(f"    - {model}")
         print()
@@ -1514,17 +1836,17 @@ def change_model_menu() -> None:
         clear_screen()
         status = parse_config_status()
         current_model = status.get("model") or ""
-        gateway_id, models = models_for_active_profile(status)
+        profile, models = models_for_active_profile(status)
 
         print(color("Change Model", Style.CYAN, Style.BOLD))
         print()
-        print(f"Current gateway: {gateway_id or 'unknown'}")
+        print(f"Current gateway: {profile.id if profile else 'unknown'}")
         print(f"Current model:   {current_model}")
         print()
 
         if not models:
             print("No model list is configured for the current provider.")
-            print("Switch to codexcn or modelhub first.")
+            print(f"Add/edit API models in: {API_CONFIG_PATH}")
             pause()
             return
 
@@ -1549,7 +1871,7 @@ def change_model_menu() -> None:
 
         clear_screen()
         print(color("Apply model", Style.CYAN, Style.BOLD))
-        print(f"Gateway: {gateway_id}")
+        print(f"Gateway: {profile.id if profile else 'unknown'}")
         print(f"Current model: {current_model}")
         print(f"Target model:  {selected}")
         print()
@@ -1673,6 +1995,8 @@ def tools_menu() -> None:
         clear_screen()
         print(color("Tools", Style.CYAN, Style.BOLD))
         print()
+        print(format_menu_item("A", "Add API gateway"))
+        print(format_menu_item("E", "Open API gateways file"))
         print(format_menu_item("T", "Test API gateways"))
         print(format_menu_item("R", "Restore hidden user chats"))
         print(format_menu_item("S", "Sync all chats to current active provider"))
@@ -1681,6 +2005,12 @@ def tools_menu() -> None:
         choice = input("Select: ").strip().lower()
         if choice == "q":
             return
+        if choice == "a":
+            add_api_gateway_menu()
+            continue
+        if choice == "e":
+            open_api_config_menu()
+            continue
         if choice == "t":
             test_apis_menu()
             continue
@@ -1704,7 +2034,8 @@ def main_menu() -> None:
         show_status()
         status = parse_config_status() if CONFIG_PATH.exists() else {}
         print(color("Choose mode:", Style.BOLD))
-        for index, profile in enumerate(PROFILES, 1):
+        available_profiles = profiles()
+        for index, profile in enumerate(available_profiles, 1):
             print(format_menu_item(str(index), profile.label, is_profile_active(profile, status)))
         print(format_menu_item("M", "Change model"))
         print(format_menu_item("T", "Tools"))
@@ -1724,7 +2055,7 @@ def main_menu() -> None:
             diagnostics_menu()
             continue
         try:
-            profile = PROFILES[int(choice) - 1]
+            profile = available_profiles[int(choice) - 1]
         except Exception:
             print("Invalid choice.")
             time.sleep(1)

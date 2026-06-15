@@ -8,10 +8,12 @@ The script is meant to live next to Codex Desktop config files in `%USERPROFILE%
 
 - Switches Codex Desktop to subscription mode (`openai` provider).
 - Switches Codex Desktop to API gateway mode through one stable provider id: `custom`.
+- Loads API gateways from an editable local JSON file instead of hardcoding them in the script.
+- Adds API gateways from the terminal, saves keys to Windows User environment variables, and fetches `/models`.
 - Keeps local chats visible by syncing thread provider metadata when changing modes.
 - Restores user-created chats hidden under a different provider.
 - Switches API gateway models and writes a Codex model catalog.
-- Tests API gateways with text requests and the current gateway with a tiny image.
+- Tests selected gateway models and prints short response bodies.
 - Creates backups before write actions and rolls back on failure where possible.
 - Refuses write actions while `Codex.exe` or `codex.exe` is running.
 
@@ -54,8 +56,7 @@ Write actions are disabled while Codex is running because the desktop app can lo
 
 ```text
 1. Subscription / OpenAI account
-2. API gateway: codexcn
-3. API gateway: modelhub
+2..N. API gateways loaded from codex_switcher_apis.json
 M. Change model
 T. Tools
 D. Diagnostics
@@ -65,6 +66,8 @@ Q. Quit
 Tools:
 
 ```text
+A. Add API gateway
+E. Open API gateways file
 T. Test API gateways
 R. Restore hidden user chats
 S. Sync all chats to current active provider
@@ -72,6 +75,39 @@ Q. Back
 ```
 
 Diagnostics shows the current config, Codex process status, and thread provider counts.
+
+## API Gateway Config
+
+API gateways are stored locally in:
+
+```text
+%USERPROFILE%\.codex\codex_switcher_apis.json
+```
+
+Use `Tools > A. Add API gateway` to create an entry from the terminal. It asks for the gateway id, base URL, env var name, optional API key, context window, then tries to fetch `/models` and stores the selected default model.
+
+Use `Tools > E. Open API gateways file` if you prefer editing JSON directly. Example format:
+
+```json
+{
+  "version": 1,
+  "gateways": [
+    {
+      "id": "my-gateway",
+      "name": "My Gateway",
+      "label": "API gateway: My Gateway",
+      "base_url": "https://example.com/v1",
+      "env_key": "MY_GATEWAY_API_KEY",
+      "models": ["gpt-5.5", "gpt-5.5-mini"],
+      "default_model": "gpt-5.5",
+      "context_window": 128000,
+      "input_modalities": ["text", "image"]
+    }
+  ]
+}
+```
+
+All API gateways still write `model_provider = "custom"` to Codex config. The gateway-specific `base_url`, `env_key`, model list, and context metadata come from the JSON file.
 
 ## Modes
 
@@ -98,13 +134,12 @@ The script intentionally uses only one API provider id, `custom`, so chats do no
 
 ## API Keys
 
-API keys are not stored in this repository or in the script.
+API keys are not stored in this repository or in `codex_switcher_apis.json`.
 
-Set keys as Windows User environment variables:
+`Tools > A. Add API gateway` can save a pasted key into a Windows User environment variable. You can also set it manually:
 
 ```text
-CODEXCN_API_KEY
-MODELHUB_API_KEY
+MY_GATEWAY_API_KEY
 ```
 
 The script reads those variables at runtime.
@@ -117,7 +152,7 @@ The script reads those variables at runtime.
 
 ## Models
 
-`M. Change model` changes only:
+`M. Change model` uses the active gateway's `models` list from `codex_switcher_apis.json` and changes only:
 
 ```toml
 model = "<selected model>"
@@ -130,19 +165,12 @@ In subscription mode the script removes `model_catalog_json` so Codex Desktop ca
 
 Generated API model entries are written for the active gateway, not for every configured gateway at once. This matters because the same model slug can exist behind multiple gateways with different limits.
 
-Configured context windows:
-
-```text
-codexcn   128000
-modelhub  400000
-```
-
-For the active gateway, entries advertise matching context metadata:
+For the active gateway, entries advertise metadata from the JSON file:
 
 ```json
-"context_window": "<active gateway limit>",
-"max_context_window": "<active gateway limit>",
-"truncation_policy": {"mode": "tokens", "limit": "<active gateway limit>"},
+"context_window": 128000,
+"max_context_window": 128000,
+"truncation_policy": {"mode": "tokens", "limit": 128000},
 "input_modalities": ["text", "image"]
 ```
 
@@ -150,10 +178,12 @@ The actual usable context and image support still depend on the selected gateway
 
 ## API Tests
 
-`Tools > T. Test API gateways` can send:
+`Tools > T. Test API gateways` can:
 
-- Text-only `/responses` requests to one or all configured gateways.
-- A tiny generated PNG image to the current API gateway through `/responses`.
+- Fetch live `/models` for a selected gateway.
+- Test a selected model with a text-only `/responses` request.
+- Test a selected model with a tiny generated PNG image through `/responses`.
+- Test default models across all configured gateways.
 
 The test prints HTTP status and a short response body. It never prints API keys.
 
@@ -180,5 +210,5 @@ backup-*-provider-menu-model-*
 
 - Close Codex Desktop before applying changes.
 - Keep backups until you have verified chats and provider switching.
-- Do not commit real API keys, `auth.json`, SQLite databases, or session JSONL files.
+- Do not commit real API keys, `auth.json`, SQLite databases, session JSONL files, or your local `codex_switcher_apis.json`.
 - This tool is local and Windows-focused.
