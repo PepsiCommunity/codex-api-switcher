@@ -49,6 +49,11 @@ MODEL_INPUT_MODALITIES = ["text", "image"]
 MODEL_EXCLUDE_FROM_AGENT_MENU = {"gpt-image-2"}
 API_CONFIG_VERSION = 1
 API_TEST_USER_AGENT = "Codex Provider Menu/1.0"
+DEFAULT_API_ID = "openai"
+DEFAULT_API_NAME = "OpenAI API"
+DEFAULT_API_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_API_ENV_KEY = "OPENAI_API_KEY"
+DEFAULT_API_MODELS = ["gpt-4.1", "gpt-4.1-mini"]
 
 
 class Style:
@@ -93,6 +98,8 @@ class Profile:
     name: str | None = None
     base_url: str | None = None
     env_key: str | None = None
+    api_key: str = ""
+    key_mode: str = "inline"
     models: tuple[str, ...] = ()
     default_model: str = ""
     context_window: int = DEFAULT_MODEL_CONTEXT_WINDOW
@@ -126,13 +133,15 @@ def get_codex_home() -> Path:
 
 
 CODEX_HOME = get_codex_home()
+SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = CODEX_HOME / "config.toml"
 DB_PATH = CODEX_HOME / "sqlite" / "state_5.sqlite"
 if not DB_PATH.exists():
     DB_PATH = CODEX_HOME / "state_5.sqlite"
 SESSION_INDEX_PATH = CODEX_HOME / "session_index.jsonl"
 MODEL_CATALOG_PATH = CODEX_HOME / "codex_provider_models.json"
-API_CONFIG_PATH = CODEX_HOME / "codex_switcher_apis.json"
+API_CONFIG_DIR = SCRIPT_DIR / "apis"
+API_SCHEMA_PATH = API_CONFIG_DIR / "schema.json"
 
 
 def clear_screen() -> None:
@@ -333,33 +342,53 @@ def api_config_template() -> dict[str, Any]:
     }
 
 
-def ensure_api_config_file() -> None:
-    if not API_CONFIG_PATH.exists():
-        atomic_write_text(API_CONFIG_PATH, json.dumps(api_config_template(), indent=2) + "\n")
+def ensure_api_config_dir() -> None:
+    API_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def is_ignored_api_config_file(path: Path) -> bool:
+    name = path.name.lower()
+    return name == "schema.json" or name.endswith(".example.json")
+
+
+def api_gateway_path(gateway_id: str) -> Path:
+    return API_CONFIG_DIR / f"{normalize_gateway_id(gateway_id)}.json"
+
+
+def gateway_entries_from_file(path: Path) -> list[Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="strict"))
+    except Exception as exc:
+        raise ProviderMenuError(f"Cannot read API config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ProviderMenuError(f"API config must be a JSON object: {path}")
+    if "gateways" in data:
+        gateways = data.get("gateways")
+        if not isinstance(gateways, list):
+            raise ProviderMenuError(f"API config field 'gateways' must be a list: {path}")
+        return list(gateways)
+    return [data]
 
 
 def read_api_config() -> dict[str, Any]:
-    if not API_CONFIG_PATH.exists():
+    if not API_CONFIG_DIR.exists():
         return api_config_template()
-    try:
-        data = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8", errors="strict"))
-    except Exception as exc:
-        raise ProviderMenuError(f"Cannot read API config {API_CONFIG_PATH}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ProviderMenuError(f"API config must be a JSON object: {API_CONFIG_PATH}")
-    gateways = data.get("gateways")
-    if gateways is None:
-        data["gateways"] = []
-    elif not isinstance(gateways, list):
-        raise ProviderMenuError(f"API config field 'gateways' must be a list: {API_CONFIG_PATH}")
-    return data
+    gateways: list[Any] = []
+    for path in sorted(API_CONFIG_DIR.glob("*.json")):
+        if is_ignored_api_config_file(path):
+            continue
+        gateways.extend(gateway_entries_from_file(path))
+    return {
+        "version": API_CONFIG_VERSION,
+        "gateways": gateways,
+    }
 
 
-def write_api_config(data: dict[str, Any]) -> None:
-    data = dict(data)
-    data["version"] = API_CONFIG_VERSION
-    data.setdefault("gateways", [])
-    atomic_write_text(API_CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+def write_api_gateway(entry: dict[str, Any]) -> Path:
+    ensure_api_config_dir()
+    path = api_gateway_path(str(entry.get("id") or "gateway"))
+    atomic_write_text(path, json.dumps(entry, ensure_ascii=False, indent=2) + "\n")
+    return path
 
 
 def unique_strings(values: Any) -> tuple[str, ...]:
@@ -395,12 +424,18 @@ def gateway_profile_from_config(item: Any, index: int) -> Profile:
     gateway_id = normalize_gateway_id(str(item.get("id") or item.get("name") or ""))
     name = str(item.get("name") or gateway_id).strip()
     base_url = str(item.get("base_url") or "").strip().rstrip("/")
+    key_mode = str(item.get("key_mode") or "inline").strip().lower()
+    if key_mode not in {"inline", "env"}:
+        key_mode = "inline"
     env_key = str(item.get("env_key") or "").strip()
+    if not env_key:
+        env_key = default_env_key(gateway_id)
+    api_key = str(item.get("api_key") or "").strip()
     if not gateway_id:
         raise ProviderMenuError(f"API gateway #{index} is missing id")
     if not base_url:
         raise ProviderMenuError(f"API gateway {gateway_id!r} is missing base_url")
-    if not env_key:
+    if key_mode == "env" and not env_key:
         raise ProviderMenuError(f"API gateway {gateway_id!r} is missing env_key")
 
     try:
@@ -425,6 +460,8 @@ def gateway_profile_from_config(item: Any, index: int) -> Profile:
         name=name,
         base_url=base_url,
         env_key=env_key,
+        api_key=api_key,
+        key_mode=key_mode,
         models=models,
         default_model=default_model,
         context_window=context_window,
@@ -439,7 +476,7 @@ def api_profiles() -> list[Profile]:
     for index, item in enumerate(config.get("gateways", []), 1):
         profile = gateway_profile_from_config(item, index)
         if profile.id in seen:
-            raise ProviderMenuError(f"Duplicate API gateway id in {API_CONFIG_PATH}: {profile.id}")
+            raise ProviderMenuError(f"Duplicate API gateway id in {API_CONFIG_DIR}: {profile.id}")
         output.append(profile)
         seen.add(profile.id)
     return output
@@ -1017,9 +1054,25 @@ def set_user_env_var(name: str, value: str) -> None:
 
 
 def get_api_key(profile: Profile) -> str:
+    if profile.key_mode == "inline":
+        return profile.api_key.strip()
     if not profile.env_key:
         return ""
     return get_user_env_var(profile.env_key).strip()
+
+
+def prepare_api_key_for_codex(profile: Profile) -> None:
+    if profile.key_mode == "inline" and profile.env_key and profile.api_key:
+        os.environ[profile.env_key] = profile.api_key
+        if os.name == "nt":
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                winreg.SetValueEx(key, profile.env_key, 0, winreg.REG_SZ, profile.api_key)
+
+
+def key_source_label(profile: Profile) -> str:
+    if profile.key_mode == "inline":
+        return f"inline key (local JSON, Desktop bridge: {profile.env_key})"
+    return f"User env var: {profile.env_key}"
 
 
 def apply_profile(profile: Profile) -> None:
@@ -1033,12 +1086,13 @@ def apply_profile(profile: Profile) -> None:
 
     try:
         if profile.kind == "api":
+            prepare_api_key_for_codex(profile)
             write_model_catalog(profile)
-            if not (profile.env_key and get_api_key(profile)):
+            if not get_api_key(profile):
                 raise ProviderMenuError(
-                    f"API key is missing. Set User environment variable: {profile.env_key}"
+                    f"API key is missing for gateway: {profile.id}"
                 )
-            print(f"Using User env var: {profile.env_key}")
+            print(f"Using API key source: {key_source_label(profile)}")
 
         changed_jsonl = 0
         for row in affected:
@@ -1158,6 +1212,7 @@ def apply_model(model: str) -> None:
     print(f"Backup: {backup_dir}")
 
     try:
+        prepare_api_key_for_codex(profile)
         write_model_catalog(profile)
         update_config_model(model)
     except Exception:
@@ -1287,11 +1342,12 @@ def post_api_json(profile: Profile, path: str, payload: dict[str, Any], timeout:
     assert profile.base_url
     api_key = get_api_key(profile)
     if not api_key:
+        source = "inline api_key" if profile.key_mode == "inline" else f"User environment variable: {profile.env_key}"
         return {
             "profile": profile.id,
             "status": "error",
             "elapsed": 0,
-            "error": f"Missing User environment variable: {profile.env_key}",
+            "error": f"Missing API key ({source})",
         }
 
     request = urllib.request.Request(
@@ -1391,12 +1447,13 @@ def fetch_api_models(profile: Profile, timeout: int = 30) -> dict[str, Any]:
     assert profile.base_url
     api_key = get_api_key(profile)
     if not api_key:
+        source = "inline api_key" if profile.key_mode == "inline" else f"User environment variable: {profile.env_key}"
         return {
             "profile": profile.id,
             "status": "error",
             "elapsed": 0,
             "models": [],
-            "error": f"Missing User environment variable: {profile.env_key}",
+            "error": f"Missing API key ({source})",
         }
     url = profile.base_url.rstrip("/") + "/models"
     request = urllib.request.Request(
@@ -1495,76 +1552,64 @@ def api_gateway_entry(
     name: str,
     base_url: str,
     env_key: str,
+    key_mode: str,
+    api_key: str,
     models: list[str],
     default_model: str,
     context_window: int,
 ) -> dict[str, Any]:
-    return {
+    entry = {
         "id": gateway_id,
         "name": name,
         "label": f"API gateway: {name}",
         "base_url": base_url.rstrip("/"),
-        "env_key": env_key,
+        "key_mode": key_mode,
         "models": models,
         "default_model": default_model,
         "context_window": context_window,
         "input_modalities": list(MODEL_INPUT_MODALITIES),
     }
+    if key_mode == "inline":
+        entry["api_key"] = api_key
+        if env_key != default_env_key(gateway_id):
+            entry["env_key"] = env_key
+    else:
+        entry["env_key"] = env_key
+    return entry
 
 
 def upsert_api_gateway(entry: dict[str, Any]) -> None:
-    config = read_api_config()
-    gateways = list(config.get("gateways", []))
-    gateway_id = normalize_gateway_id(str(entry.get("id") or ""))
-    replaced = False
-    for index, item in enumerate(gateways):
-        if isinstance(item, dict) and normalize_gateway_id(str(item.get("id") or "")) == gateway_id:
-            gateways[index] = entry
-            replaced = True
-            break
-    if not replaced:
-        gateways.append(entry)
-    config["gateways"] = gateways
-    write_api_config(config)
+    write_api_gateway(entry)
 
 
 def add_api_gateway_menu() -> None:
     clear_screen()
     print(color("Add API Gateway", Style.CYAN, Style.BOLD))
     print()
-    print(f"Config file: {API_CONFIG_PATH}")
-    print("API keys are saved as Windows User environment variables, not in the JSON file.")
+    print(f"Config folder: {API_CONFIG_DIR}")
+    print("Default key mode stores the API key in the local ignored JSON file.")
     print()
 
-    current_provider: dict[str, Any] = {}
-    try:
-        status = parse_config_status()
-        if status.get("model_provider") == "custom":
-            current_provider = active_provider_config(status)
-    except Exception:
-        current_provider = {}
-
-    current_name = str(current_provider.get("name") or "").strip()
-    current_base_url = str(current_provider.get("base_url") or "").strip().rstrip("/")
-    current_env_key = str(current_provider.get("env_key") or "").strip()
-    default_id = normalize_gateway_id(current_name)
-
-    id_prompt = f"Gateway id [{default_id}]: " if default_id else "Gateway id (example: my-gateway): "
-    raw_id = input(id_prompt).strip() or default_id
+    raw_id = input(f"Gateway id [{DEFAULT_API_ID}]: ").strip() or DEFAULT_API_ID
     gateway_id = normalize_gateway_id(raw_id)
     if not gateway_id:
         print("Gateway id is required.")
         pause()
         return
-    name = input(f"Display name [{current_name or gateway_id}]: ").strip() or current_name or gateway_id
-    base_prompt = f"Base URL ending with /v1 [{current_base_url}]: " if current_base_url else "Base URL ending with /v1: "
-    base_url = (input(base_prompt).strip() or current_base_url).rstrip("/")
+    name = input(f"Display name [{DEFAULT_API_NAME}]: ").strip() or DEFAULT_API_NAME
+    base_url = (input(f"Base URL ending with /v1 [{DEFAULT_API_BASE_URL}]: ").strip() or DEFAULT_API_BASE_URL).rstrip("/")
     if not base_url:
         print("Base URL is required.")
         pause()
         return
-    default_key = current_env_key or default_env_key(gateway_id)
-    env_key = input(f"API key env var [{default_key}]: ").strip() or default_key
+    key_mode_answer = input("Key mode: Enter = inline JSON, E = environment variable: ").strip().lower()
+    key_mode = "env" if key_mode_answer == "e" else "inline"
+    default_key = DEFAULT_API_ENV_KEY if gateway_id == DEFAULT_API_ID else default_env_key(gateway_id)
+    if key_mode == "env":
+        env_key = input(f"API key env var [{default_key}]: ").strip() or default_key
+    else:
+        env_key = default_key
+        print(f"Desktop env bridge: {env_key}")
 
     try:
         context_text = input(f"Context window [{DEFAULT_MODEL_CONTEXT_WINDOW}]: ").strip()
@@ -1572,13 +1617,14 @@ def add_api_gateway_menu() -> None:
     except ValueError:
         context_window = DEFAULT_MODEL_CONTEXT_WINDOW
 
-    key = prompt_secret("API key (optional, hidden, saved to User env var): ")
-    if key:
+    key = prompt_secret("API key (optional, hidden): ")
+    if key and key_mode == "env":
         try:
             set_user_env_var(env_key, key)
             print(f"Saved API key to User env var: {env_key}")
         except Exception as exc:
             print(f"Could not persist API key: {exc}")
+    api_key = key if key_mode == "inline" else ""
 
     temp_profile = Profile(
         id=gateway_id,
@@ -1588,6 +1634,8 @@ def add_api_gateway_menu() -> None:
         name=name,
         base_url=base_url,
         env_key=env_key,
+        api_key=api_key,
+        key_mode=key_mode,
     )
 
     models: list[str] = []
@@ -1608,7 +1656,13 @@ def add_api_gateway_menu() -> None:
                 print(result)
 
     if not models:
-        manual = input("Models (comma-separated, required for model picker): ").strip()
+        default_models_text = ", ".join(DEFAULT_API_MODELS) if gateway_id == DEFAULT_API_ID else ""
+        prompt = (
+            f"Models (comma-separated) [{default_models_text}]: "
+            if default_models_text
+            else "Models (comma-separated, required for model picker): "
+        )
+        manual = input(prompt).strip() or default_models_text
         models = parse_models_text(manual)
     if not models:
         print("No models were configured. Gateway was not saved.")
@@ -1625,27 +1679,32 @@ def add_api_gateway_menu() -> None:
             name=name,
             base_url=base_url,
             env_key=env_key,
+            key_mode=key_mode,
+            api_key=api_key,
             models=models,
             default_model=default_model,
             context_window=context_window,
         )
     )
+    saved_path = api_gateway_path(gateway_id)
     print()
     print(f"Saved API gateway: {gateway_id}")
+    print(f"Config file: {saved_path}")
     print(f"Models stored: {len(models)}")
     print(f"Default model: {default_model}")
     pause()
 
 
 def open_api_config_menu() -> None:
-    ensure_api_config_file()
+    ensure_api_config_dir()
     clear_screen()
     print(color("API Gateway Config", Style.CYAN, Style.BOLD))
     print()
-    print(f"Config file: {API_CONFIG_PATH}")
+    print(f"Config folder: {API_CONFIG_DIR}")
+    print(f"Schema:        {API_SCHEMA_PATH}")
     if os.name == "nt":
-        subprocess.Popen(["notepad", str(API_CONFIG_PATH)])
-        print("Opened in Notepad. Save the file, then return to this menu.")
+        subprocess.Popen(["explorer", str(API_CONFIG_DIR)])
+        print("Opened the API config folder. Add or edit local *.json files there.")
     print()
     pause()
 
@@ -1672,7 +1731,7 @@ def test_single_api_menu(profile: Profile) -> None:
     print(color(f"Test API Gateway: {profile.label}", Style.CYAN, Style.BOLD))
     print()
     print(f"Base URL: {profile.base_url}")
-    print(f"Env key:  {profile.env_key}")
+    print(f"Key:      {key_source_label(profile)}")
     print()
     models = models_for_test(profile)
     if not models:
@@ -1709,7 +1768,7 @@ def test_apis_menu() -> None:
         gateways = api_profiles()
         if not gateways:
             print(f"No API gateways configured. Add one in Tools > Add API gateway.")
-            print(f"Config file: {API_CONFIG_PATH}")
+            print(f"Config folder: {API_CONFIG_DIR}")
             print()
             print("  Q. Back")
         else:
@@ -1802,7 +1861,7 @@ def refresh_models_menu() -> None:
     print()
     gateways = api_profiles()
     if not gateways:
-        print(f"No API gateways configured: {API_CONFIG_PATH}")
+        print(f"No API gateways configured: {API_CONFIG_DIR}")
         pause()
         return
     for profile in gateways:
@@ -1846,7 +1905,7 @@ def change_model_menu() -> None:
 
         if not models:
             print("No model list is configured for the current provider.")
-            print(f"Add/edit API models in: {API_CONFIG_PATH}")
+            print(f"Add/edit API models in: {API_CONFIG_DIR}")
             pause()
             return
 
@@ -1893,7 +1952,7 @@ def apply_profile_menu(profile: Profile) -> None:
     print(f"Target provider: {profile.provider}")
     if profile.kind == "api":
         print(f"Gateway: {profile.base_url}")
-        print(f"Env key: {profile.env_key}")
+        print(f"Key: {key_source_label(profile)}")
         print("Auth mode: requires_openai_auth=false")
     print()
     print("This will make all local chats visible under the selected provider.")
@@ -1996,7 +2055,7 @@ def tools_menu() -> None:
         print(color("Tools", Style.CYAN, Style.BOLD))
         print()
         print(format_menu_item("A", "Add API gateway"))
-        print(format_menu_item("E", "Open API gateways file"))
+        print(format_menu_item("E", "Open API gateways folder"))
         print(format_menu_item("T", "Test API gateways"))
         print(format_menu_item("R", "Restore hidden user chats"))
         print(format_menu_item("S", "Sync all chats to current active provider"))

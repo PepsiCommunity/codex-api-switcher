@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Switcher API Gateway",
+  "description": "One local API gateway config for Codex Switcher.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "name", "base_url", "models", "default_model"],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*$",
+      "description": "Stable local id; also used as the file name when added from the TUI."
+    },
+    "name": {
+      "type": "string",
+      "description": "Human-readable gateway name."
+    },
+    "label": {
+      "type": "string",
+      "description": "Optional menu label. Defaults to 'API gateway: <name>'."
+    },
+    "base_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "OpenAI-compatible base URL, usually ending with /v1."
+    },
+    "key_mode": {
+      "type": "string",
+      "enum": ["inline", "env"],
+      "default": "inline",
+      "description": "inline stores api_key in the ignored local JSON file; env reads the key from env_key."
+    },
+    "api_key": {
+      "type": "string",
+      "description": "Static key for key_mode=inline. Local gateway JSON files are ignored by git."
+    },
+    "env_key": {
+      "type": "string",
+      "pattern": "^[A-Z_][A-Z0-9_]*$",
+      "description": "Optional for inline mode; if omitted, the menu generates a Desktop bridge env var from id. Required for key_mode=env."
+    },
+    "models": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "default_model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "context_window": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 128000
+    },
+    "input_modalities": {
+      "type": "array",
+      "uniqueItems": true,
+      "default": ["text", "image"],
+      "items": {
+        "type": "string",
+        "enum": ["text", "image"]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"key_mode": {"const": "env"}}
+      },
+      "then": {
+        "required": ["env_key"]
+      }
+    },
+    {
+      "if": {
+        "properties": {"key_mode": {"const": "inline"}}
+      },
+      "then": {
+        "required": ["api_key"]
+      }
+    }
+  ]
+}

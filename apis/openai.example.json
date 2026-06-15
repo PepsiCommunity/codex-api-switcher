@@ -1,0 +1,16 @@
+{
+  "$schema": "./schema.json",
+  "id": "openai",
+  "name": "OpenAI API",
+  "label": "API gateway: OpenAI API",
+  "base_url": "https://api.openai.com/v1",
+  "key_mode": "inline",
+  "api_key": "sk-your-openai-api-key",
+  "models": [
+    "gpt-4.1",
+    "gpt-4.1-mini"
+  ],
+  "default_model": "gpt-4.1",
+  "context_window": 128000,
+  "input_modalities": ["text", "image"]
+}

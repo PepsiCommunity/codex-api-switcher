@@ -8,8 +8,8 @@ The script is meant to live next to Codex Desktop config files in `%USERPROFILE%
 
 - Switches Codex Desktop to subscription mode (`openai` provider).
 - Switches Codex Desktop to API gateway mode through one stable provider id: `custom`.
-- Loads API gateways from an editable local JSON file instead of hardcoding them in the script.
-- Adds API gateways from the terminal, saves keys to Windows User environment variables, and fetches `/models`.
+- Loads API gateways from local JSON files in an `apis/` folder next to the script.
+- Adds API gateways from the terminal, stores keys either inline in ignored JSON or in Windows User environment variables, and fetches `/models`.
 - Keeps local chats visible by syncing thread provider metadata when changing modes.
 - Restores user-created chats hidden under a different provider.
 - Switches API gateway models and writes a Codex model catalog.
@@ -23,14 +23,18 @@ The script is meant to live next to Codex Desktop config files in `%USERPROFILE%
 codex_provider_menu.cmd   Double-click launcher for Explorer
 codex_provider_menu.py    Main TUI implementation
 codex_provider_menu.ps1   PowerShell compatibility launcher
+apis/README.md            Local API config guide
+apis/schema.json          JSON Schema for API configs
+apis/openai.example.json  Copyable OpenAI API example
 README.md                 This file
 ```
 
 ## Install
 
-Copy these files to `%USERPROFILE%\.codex`:
+Copy these files and folders to `%USERPROFILE%\.codex`:
 
 ```text
+apis/
 codex_provider_menu.cmd
 codex_provider_menu.py
 codex_provider_menu.ps1
@@ -56,7 +60,7 @@ Write actions are disabled while Codex is running because the desktop app can lo
 
 ```text
 1. Subscription / OpenAI account
-2..N. API gateways loaded from codex_switcher_apis.json
+2..N. API gateways loaded from apis/*.json
 M. Change model
 T. Tools
 D. Diagnostics
@@ -67,7 +71,7 @@ Tools:
 
 ```text
 A. Add API gateway
-E. Open API gateways file
+E. Open API gateways folder
 T. Test API gateways
 R. Restore hidden user chats
 S. Sync all chats to current active provider
@@ -76,38 +80,51 @@ Q. Back
 
 Diagnostics shows the current config, Codex process status, and thread provider counts.
 
-## API Gateway Config
+## API Gateway Configs
 
-API gateways are stored locally in:
+API gateways are stored as local JSON files next to the script:
 
 ```text
-%USERPROFILE%\.codex\codex_switcher_apis.json
+<codex_provider_menu.py directory>\apis\*.json
 ```
 
-Use `Tools > A. Add API gateway` to create an entry from the terminal. It asks for the gateway id, base URL, env var name, optional API key, context window, then tries to fetch `/models` and stores the selected default model.
+When installed normally, that is:
 
-Use `Tools > E. Open API gateways file` if you prefer editing JSON directly. Example format:
+```text
+%USERPROFILE%\.codex\apis\*.json
+```
+
+Real `apis/*.json` files are ignored by git. The repository only tracks:
+
+```text
+apis/README.md
+apis/schema.json
+apis/openai.example.json
+```
+
+Use `Tools > A. Add API gateway` to create `apis/<gateway-id>.json` from the terminal. It asks for the gateway id, base URL, key mode, API key, context window, then tries to fetch `/models` and stores the selected default model.
+
+Use `Tools > E. Open API gateways folder` if you prefer editing JSON directly.
+
+OpenAI API example using the default inline key mode:
 
 ```json
 {
-  "version": 1,
-  "gateways": [
-    {
-      "id": "my-gateway",
-      "name": "My Gateway",
-      "label": "API gateway: My Gateway",
-      "base_url": "https://example.com/v1",
-      "env_key": "MY_GATEWAY_API_KEY",
-      "models": ["gpt-5.5", "gpt-5.5-mini"],
-      "default_model": "gpt-5.5",
-      "context_window": 128000,
-      "input_modalities": ["text", "image"]
-    }
-  ]
+  "$schema": "./schema.json",
+  "id": "openai",
+  "name": "OpenAI API",
+  "label": "API gateway: OpenAI API",
+  "base_url": "https://api.openai.com/v1",
+  "key_mode": "inline",
+  "api_key": "sk-your-openai-api-key",
+  "models": ["gpt-4.1", "gpt-4.1-mini"],
+  "default_model": "gpt-4.1",
+  "context_window": 128000,
+  "input_modalities": ["text", "image"]
 }
 ```
 
-All API gateways still write `model_provider = "custom"` to Codex config. The gateway-specific `base_url`, `env_key`, model list, and context metadata come from the JSON file.
+All API gateways still write `model_provider = "custom"` to Codex config. The gateway-specific `base_url`, model list, and context metadata come from the JSON files. For inline keys, `env_key` is optional; if omitted, the script generates an internal Desktop bridge env var from the gateway id and persists it when applying.
 
 ## Modes
 
@@ -134,15 +151,11 @@ The script intentionally uses only one API provider id, `custom`, so chats do no
 
 ## API Keys
 
-API keys are not stored in this repository or in `codex_switcher_apis.json`.
+Default key mode is `inline`: the key is stored in the local ignored gateway JSON file as `api_key`, with no manual env var setup required.
 
-`Tools > A. Add API gateway` can save a pasted key into a Windows User environment variable. You can also set it manually:
+Optional key mode is `env`: set `key_mode` to `env`, set `env_key`, and store the key in Windows User environment variables.
 
-```text
-MY_GATEWAY_API_KEY
-```
-
-The script reads those variables at runtime.
+The script never prints API keys. Do not commit local `apis/*.json` files.
 
 ## Chat Recovery
 
@@ -152,7 +165,7 @@ The script reads those variables at runtime.
 
 ## Models
 
-`M. Change model` uses the active gateway's `models` list from `codex_switcher_apis.json` and changes only:
+`M. Change model` uses the active gateway's `models` list from its local API JSON file and changes only:
 
 ```toml
 model = "<selected model>"
@@ -210,5 +223,6 @@ backup-*-provider-menu-model-*
 
 - Close Codex Desktop before applying changes.
 - Keep backups until you have verified chats and provider switching.
-- Do not commit real API keys, `auth.json`, SQLite databases, session JSONL files, or your local `codex_switcher_apis.json`.
+- Do not commit real API keys, `auth.json`, SQLite databases, session JSONL files, or local `apis/*.json` gateway files.
 - This tool is local and Windows-focused.
+
