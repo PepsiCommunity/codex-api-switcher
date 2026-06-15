@@ -80,7 +80,8 @@ def enable_windows_colors() -> bool:
         return False
 
 
-USE_COLOR = bool(sys.stdout.isatty() and not os.environ.get("NO_COLOR") and enable_windows_colors())
+USE_ANSI = bool(sys.stdout.isatty() and enable_windows_colors())
+USE_COLOR = bool(USE_ANSI and not os.environ.get("NO_COLOR"))
 
 
 def color(text: str, *styles: str) -> str:
@@ -104,6 +105,14 @@ class Profile:
     default_model: str = ""
     context_window: int = DEFAULT_MODEL_CONTEXT_WINDOW
     input_modalities: tuple[str, ...] = ("text", "image")
+
+
+@dataclass(frozen=True)
+class MenuItem:
+    label: str
+    value: Any
+    active: bool = False
+    shortcut: str = ""
 
 
 SUBSCRIPTION_PROFILE = Profile(
@@ -186,18 +195,64 @@ def is_real_codex_home() -> bool:
         return str(CODEX_HOME).lower() == str(default_codex_home()).lower()
 
 
+def list_codex_processes_winapi() -> list[dict[str, str]] | None:
+    if os.name != "nt":
+        return []
+    try:
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", ctypes.c_ulong),
+                ("cntUsage", ctypes.c_ulong),
+                ("th32ProcessID", ctypes.c_ulong),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", ctypes.c_ulong),
+                ("cntThreads", ctypes.c_ulong),
+                ("th32ParentProcessID", ctypes.c_ulong),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.c_ulong),
+                ("szExeFile", ctypes.c_wchar * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_ulong, ctypes.c_ulong]
+        kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32FirstW.restype = ctypes.c_int
+        kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snapshot == ctypes.c_void_p(-1).value:
+            return None
+
+        processes: list[dict[str, str]] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                return []
+            while True:
+                image = entry.szExeFile
+                if image.lower() == "codex.exe":
+                    processes.append({"image": image, "pid": str(entry.th32ProcessID)})
+                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return processes
+    except Exception:
+        return None
+
+
 def list_codex_processes() -> list[dict[str, str]]:
+    winapi_processes = list_codex_processes_winapi()
+    if winapi_processes is not None:
+        return winapi_processes
+
     try:
         result = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq Codex.exe", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        result2 = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq codex.exe", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -209,15 +264,14 @@ def list_codex_processes() -> list[dict[str, str]]:
 
     processes: list[dict[str, str]] = []
     seen_pids: set[str] = set()
-    for output in [result.stdout, result2.stdout]:
-        for row in csv.reader(io.StringIO(output)):
-            if len(row) < 2:
-                continue
-            image = row[0].strip()
-            pid = row[1].strip()
-            if image.lower() in {"codex.exe"} and pid not in seen_pids:
-                processes.append({"image": image, "pid": pid})
-                seen_pids.add(pid)
+    for row in csv.reader(io.StringIO(result.stdout)):
+        if len(row) < 2:
+            continue
+        image = row[0].strip()
+        pid = row[1].strip()
+        if image.lower() in {"codex.exe"} and pid not in seen_pids:
+            processes.append({"image": image, "pid": pid})
+            seen_pids.add(pid)
     return processes
 
 
@@ -579,11 +633,167 @@ def is_profile_active(profile: Profile, status: dict[str, Any]) -> bool:
     )
 
 
-def format_menu_item(key: str, label: str, active: bool = False) -> str:
-    marker = color("[active]", Style.GREEN, Style.BOLD) if active else color("[ ]", Style.DIM)
-    key_text = color(key, Style.CYAN, Style.BOLD)
-    label_text = color(label, Style.BOLD) if active else label
-    return f"  {key_text}. {label_text} {marker}"
+def format_menu_item(label: str, selected: bool = False, active: bool = False) -> str:
+    pointer = color(">", Style.CYAN, Style.BOLD) if selected else " "
+    label_text = color(label, Style.BOLD) if selected or active else label
+    marker = f" {color('[active]', Style.GREEN, Style.BOLD)}" if active else ""
+    return f"  {pointer} {label_text}{marker}"
+
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+
+
+def menu_body_lines(items: list[MenuItem], selected: int, help_text: str) -> list[str]:
+    lines = [
+        format_menu_item(item.label, selected=index == selected, active=item.active)
+        for index, item in enumerate(items)
+    ]
+    lines.append("")
+    lines.append(color(help_text, Style.DIM))
+    return lines
+
+
+def can_repaint_menu_body(lines: list[str]) -> bool:
+    if not USE_ANSI:
+        return False
+    columns = shutil.get_terminal_size((120, 30)).columns
+    return all(len(strip_ansi(line)) < columns for line in lines)
+
+
+def print_menu_body(lines: list[str]) -> None:
+    for line in lines:
+        print(line)
+
+
+def repaint_menu_body(lines: list[str]) -> None:
+    sys.stdout.write(f"\x1b[{len(lines)}F")
+    for line in lines:
+        sys.stdout.write("\x1b[2K" + line + "\n")
+    sys.stdout.flush()
+
+
+def read_menu_key(prompt: str = "Select") -> str:
+    if not sys.stdin.isatty():
+        try:
+            return input(f"{prompt}: ").strip().lower()
+        except EOFError:
+            return "escape"
+
+    if os.name == "nt":
+        import msvcrt
+
+        char = msvcrt.getwch()
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char in {"\r", "\n"}:
+            return "enter"
+        if char == "\x1b":
+            return "escape"
+        if char in {"\x00", "\xe0"}:
+            code = msvcrt.getwch()
+            return {
+                "H": "up",
+                "P": "down",
+                "K": "left",
+                "M": "right",
+                "G": "home",
+                "O": "end",
+                "I": "pageup",
+                "Q": "pagedown",
+            }.get(code, "")
+        return char.lower()
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        char = sys.stdin.read(1)
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char in {"\r", "\n"}:
+            return "enter"
+        if char == "\x1b":
+            seq = sys.stdin.read(2)
+            return {
+                "[A": "up",
+                "[B": "down",
+                "[D": "left",
+                "[C": "right",
+                "[H": "home",
+                "[F": "end",
+                "[5": "pageup",
+                "[6": "pagedown",
+            }.get(seq, "escape")
+        return char.lower()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def first_active_index(items: list[MenuItem]) -> int:
+    for index, item in enumerate(items):
+        if item.active:
+            return index
+    return 0
+
+
+def select_menu(
+    items: list[MenuItem],
+    render_header,
+    *,
+    initial_index: int = 0,
+    cancel_value: Any = None,
+    help_text: str = "Use arrow keys and Enter. Esc/Q goes back.",
+) -> Any:
+    if not items:
+        raise ProviderMenuError("Menu has no items.")
+
+    selected = max(0, min(initial_index, len(items) - 1))
+    shortcuts = {item.shortcut.lower(): item.value for item in items if item.shortcut}
+    lines = menu_body_lines(items, selected, help_text)
+    fast_repaint = can_repaint_menu_body(lines)
+
+    render_header()
+    print_menu_body(lines)
+
+    while True:
+        key = read_menu_key()
+        next_selected = selected
+        if key in {"up", "left"}:
+            next_selected = (selected - 1) % len(items)
+        elif key in {"down", "right"}:
+            next_selected = (selected + 1) % len(items)
+        elif key == "home":
+            next_selected = 0
+        elif key == "end":
+            next_selected = len(items) - 1
+        elif key == "pageup":
+            next_selected = max(0, selected - 10)
+        elif key == "pagedown":
+            next_selected = min(len(items) - 1, selected + 10)
+        elif key == "enter":
+            return items[selected].value
+        elif key in shortcuts:
+            return shortcuts[key]
+        elif key in {"escape", "q"} and cancel_value is not None:
+            return cancel_value
+        elif not sys.stdin.isatty():
+            print("Invalid choice.")
+            time.sleep(1)
+            render_header()
+            print_menu_body(lines)
+
+        if next_selected != selected:
+            selected = next_selected
+            lines = menu_body_lines(items, selected, help_text)
+            if fast_repaint:
+                repaint_menu_body(lines)
+            else:
+                render_header()
+                print_menu_body(lines)
 
 
 def display_model_name(model: str) -> str:
@@ -1293,6 +1503,17 @@ def show_status(include_thread_providers: bool = False) -> None:
     print()
 
 
+def status_text(include_thread_providers: bool = False) -> str:
+    original_stdout = sys.stdout
+    buffer = io.StringIO()
+    try:
+        sys.stdout = buffer
+        show_status(include_thread_providers=include_thread_providers)
+    finally:
+        sys.stdout = original_stdout
+    return buffer.getvalue()
+
+
 def run_with_spinner(label: str, func, timeout: int = 30) -> tuple[bool, Any]:
     result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue()
 
@@ -1524,21 +1745,50 @@ def parse_models_text(text: str) -> list[str]:
 
 def choose_model(models: list[str], prompt: str = "Model", default: str = "") -> str:
     visible = models[:50]
-    for index, model in enumerate(visible, 1):
-        marker = " [default]" if model == default else ""
-        print(f"  {index}. {model}{marker}")
+    if not sys.stdin.isatty():
+        for index, model in enumerate(visible, 1):
+            marker = " [default]" if model == default else ""
+            print(f"  {index}. {model}{marker}")
+        if len(models) > len(visible):
+            print(f"  ... {len(models) - len(visible)} more; type an exact model slug to use one of them")
+        if default:
+            print(f"  Enter. {default}")
+        answer = input(f"{prompt}: ").strip()
+        if not answer:
+            return default
+        if answer.isdigit():
+            index = int(answer) - 1
+            if 0 <= index < len(visible):
+                return visible[index]
+        return answer
+
+    items = [
+        MenuItem(model, ("model", model), active=model == default, shortcut=str(index))
+        for index, model in enumerate(visible, 1)
+    ]
     if len(models) > len(visible):
-        print(f"  ... {len(models) - len(visible)} more; type an exact model slug to use one of them")
-    if default:
-        print(f"  Enter. {default}")
-    answer = input(f"{prompt}: ").strip()
-    if not answer:
-        return default
-    if answer.isdigit():
-        index = int(answer) - 1
-        if 0 <= index < len(visible):
-            return visible[index]
-    return answer
+        items.append(MenuItem("Type exact model slug...", ("manual", ""), shortcut="m"))
+    if not items:
+        return input(f"{prompt}: ").strip() or default
+
+    def render() -> None:
+        clear_screen()
+        print(color(prompt, Style.CYAN, Style.BOLD))
+        if len(models) > len(visible):
+            print(color(f"Showing first {len(visible)} of {len(models)} models.", Style.DIM))
+        print()
+
+    choice = select_menu(
+        items,
+        render,
+        initial_index=first_active_index(items),
+        cancel_value=("model", default),
+        help_text="Use arrow keys and Enter. Esc keeps the current/default model.",
+    )
+    kind, value = choice
+    if kind == "manual":
+        return input("Model slug: ").strip() or default
+    return value
 
 
 def prompt_secret(prompt: str) -> str:
@@ -1602,8 +1852,26 @@ def add_api_gateway_menu() -> None:
         print("Base URL is required.")
         pause()
         return
-    key_mode_answer = input("Key mode: Enter = inline JSON, E = environment variable: ").strip().lower()
-    key_mode = "env" if key_mode_answer == "e" else "inline"
+    if sys.stdin.isatty():
+        def render_key_mode() -> None:
+            clear_screen()
+            print(color("API key storage", Style.CYAN, Style.BOLD))
+            print(f"Gateway: {name}")
+            print(f"Base URL: {base_url}")
+            print()
+
+        key_mode = select_menu(
+            [
+                MenuItem("Inline key in local JSON (default)", "inline", shortcut="i"),
+                MenuItem("Environment variable", "env", shortcut="e"),
+            ],
+            render_key_mode,
+            cancel_value="inline",
+            help_text="Use arrow keys and Enter. Esc keeps inline JSON.",
+        )
+    else:
+        key_mode_answer = input("Key mode: Enter = inline JSON, E = environment variable: ").strip().lower()
+        key_mode = "env" if key_mode_answer == "e" else "inline"
     default_key = DEFAULT_API_ENV_KEY if gateway_id == DEFAULT_API_ID else default_env_key(gateway_id)
     if key_mode == "env":
         env_key = input(f"API key env var [{default_key}]: ").strip() or default_key
@@ -1742,8 +2010,31 @@ def test_single_api_menu(profile: Profile) -> None:
         print("No model selected.")
         pause()
         return
-    mode = input("Press Enter for text test, or type I for image test: ").strip().lower()
-    include_image = mode == "i"
+    if sys.stdin.isatty():
+        def render_test_mode() -> None:
+            clear_screen()
+            print(color(f"Test API Gateway: {profile.label}", Style.CYAN, Style.BOLD))
+            print()
+            print(f"Base URL: {profile.base_url}")
+            print(f"Key:      {key_source_label(profile)}")
+            print(f"Model:    {model}")
+            print()
+
+        mode = select_menu(
+            [
+                MenuItem("Text response test", "text", shortcut="t"),
+                MenuItem("Image input test", "image", shortcut="i"),
+                MenuItem("Back", "back", shortcut="q"),
+            ],
+            render_test_mode,
+            cancel_value="back",
+        )
+        if mode == "back":
+            return
+        include_image = mode == "image"
+    else:
+        mode = input("Press Enter for text test, or type I for image test: ").strip().lower()
+        include_image = mode == "i"
 
     print()
     label = f"Testing {profile.id} / {model}"
@@ -1762,31 +2053,38 @@ def test_single_api_menu(profile: Profile) -> None:
 
 def test_apis_menu() -> None:
     while True:
-        clear_screen()
-        print("API Test")
-        print()
         gateways = api_profiles()
         if not gateways:
-            print(f"No API gateways configured. Add one in Tools > Add API gateway.")
-            print(f"Config folder: {API_CONFIG_DIR}")
-            print()
-            print("  Q. Back")
+            items = [MenuItem("Back", "back", shortcut="q")]
         else:
+            items = []
             for index, profile in enumerate(gateways, 1):
                 default_model = default_model_for_profile(profile)
                 suffix = f" ({default_model})" if default_model else ""
-                print(f"  {index}. Test selected model: {profile.label}{suffix}")
-            print("  A. Test default model on all gateways")
-            print("  Q. Back")
-        print()
-        choice = input("Select: ").strip().lower()
-        if choice == "q":
-            return
+                items.append(MenuItem(f"Test selected model: {profile.label}{suffix}", ("profile", profile), shortcut=str(index)))
+            items.extend(
+                [
+                    MenuItem("Test default model on all gateways", ("all", None), shortcut="a"),
+                    MenuItem("Back", ("back", None), shortcut="q"),
+                ]
+            )
+
+        def render() -> None:
+            clear_screen()
+            print(color("API Test", Style.CYAN, Style.BOLD))
+            print()
+            if not gateways:
+                print(f"No API gateways configured. Add one in Tools > Add API gateway.")
+                print(f"Config folder: {API_CONFIG_DIR}")
+                print()
+
+        choice = select_menu(items, render, cancel_value=("back", None) if gateways else "back")
         if not gateways:
-            print("Invalid choice.")
-            time.sleep(1)
-            continue
-        if choice == "a":
+            return
+        kind, value = choice
+        if kind == "back":
+            return
+        if kind == "all":
             print()
             for profile in gateways:
                 model = default_model_for_profile(profile)
@@ -1805,13 +2103,7 @@ def test_apis_menu() -> None:
             print()
             pause()
             continue
-        try:
-            profile = gateways[int(choice) - 1]
-        except Exception:
-            print("Invalid choice.")
-            time.sleep(1)
-            continue
-        test_single_api_menu(profile)
+        test_single_api_menu(value)
 
 
 def print_api_result(result: dict[str, Any]) -> None:
@@ -1892,40 +2184,48 @@ def refresh_models_menu() -> None:
 
 def change_model_menu() -> None:
     while True:
-        clear_screen()
         status = parse_config_status()
         current_model = status.get("model") or ""
         profile, models = models_for_active_profile(status)
 
-        print(color("Change Model", Style.CYAN, Style.BOLD))
-        print()
-        print(f"Current gateway: {profile.id if profile else 'unknown'}")
-        print(f"Current model:   {current_model}")
-        print()
+        def render() -> None:
+            clear_screen()
+            print(color("Change Model", Style.CYAN, Style.BOLD))
+            print()
+            print(f"Current gateway: {profile.id if profile else 'unknown'}")
+            print(f"Current model:   {current_model}")
+            print()
 
         if not models:
+            render()
             print("No model list is configured for the current provider.")
             print(f"Add/edit API models in: {API_CONFIG_DIR}")
             pause()
             return
 
-        for index, model in enumerate(models, 1):
-            active = model == current_model
-            print(format_menu_item(str(index), f"{display_model_name(model)} ({model})", active))
-        print(format_menu_item("L", "List live /models from gateways"))
-        print(format_menu_item("Q", "Back"))
-        print()
-        choice = input("Select: ").strip().lower()
-        if choice == "q":
+        items = [
+            MenuItem(
+                f"{display_model_name(model)} ({model})",
+                ("model", model),
+                active=model == current_model,
+                shortcut=str(index),
+            )
+            for index, model in enumerate(models, 1)
+        ]
+        items.append(MenuItem("List live /models from gateways", ("list", ""), shortcut="l"))
+        items.append(MenuItem("Back", ("back", ""), shortcut="q"))
+
+        choice = select_menu(
+            items,
+            render,
+            initial_index=first_active_index(items),
+            cancel_value=("back", ""),
+        )
+        kind, selected = choice
+        if kind == "back":
             return
-        if choice == "l":
+        if kind == "list":
             refresh_models_menu()
-            continue
-        try:
-            selected = models[int(choice) - 1]
-        except Exception:
-            print("Invalid choice.")
-            time.sleep(1)
             continue
 
         clear_screen()
@@ -2051,36 +2351,38 @@ def restore_hidden_chats_menu() -> None:
 
 def tools_menu() -> None:
     while True:
-        clear_screen()
-        print(color("Tools", Style.CYAN, Style.BOLD))
-        print()
-        print(format_menu_item("A", "Add API gateway"))
-        print(format_menu_item("E", "Open API gateways folder"))
-        print(format_menu_item("T", "Test API gateways"))
-        print(format_menu_item("R", "Restore hidden user chats"))
-        print(format_menu_item("S", "Sync all chats to current active provider"))
-        print(format_menu_item("Q", "Back"))
-        print()
-        choice = input("Select: ").strip().lower()
-        if choice == "q":
+        items = [
+            MenuItem("Add API gateway", "add", shortcut="a"),
+            MenuItem("Open API gateways folder", "open", shortcut="e"),
+            MenuItem("Test API gateways", "test", shortcut="t"),
+            MenuItem("Restore hidden user chats", "restore", shortcut="r"),
+            MenuItem("Sync all chats to current active provider", "sync", shortcut="s"),
+            MenuItem("Back", "back", shortcut="q"),
+        ]
+
+        def render() -> None:
+            clear_screen()
+            print(color("Tools", Style.CYAN, Style.BOLD))
+            print()
+
+        choice = select_menu(items, render, cancel_value="back")
+        if choice == "back":
             return
-        if choice == "a":
+        if choice == "add":
             add_api_gateway_menu()
             continue
-        if choice == "e":
+        if choice == "open":
             open_api_config_menu()
             continue
-        if choice == "t":
+        if choice == "test":
             test_apis_menu()
             continue
-        if choice == "r":
+        if choice == "restore":
             restore_hidden_chats_menu()
             continue
-        if choice == "s":
+        if choice == "sync":
             sync_current_menu()
             continue
-        print("Invalid choice.")
-        time.sleep(1)
 
 
 def diagnostics_menu() -> None:
@@ -2090,36 +2392,47 @@ def diagnostics_menu() -> None:
 
 def main_menu() -> None:
     while True:
-        show_status()
+        header = status_text()
         status = parse_config_status() if CONFIG_PATH.exists() else {}
-        print(color("Choose mode:", Style.BOLD))
         available_profiles = profiles()
-        for index, profile in enumerate(available_profiles, 1):
-            print(format_menu_item(str(index), profile.label, is_profile_active(profile, status)))
-        print(format_menu_item("M", "Change model"))
-        print(format_menu_item("T", "Tools"))
-        print(format_menu_item("D", "Diagnostics"))
-        print(format_menu_item("Q", "Quit"))
-        print()
-        choice = input("Select: ").strip().lower()
-        if choice == "q":
+        items = [
+            MenuItem(profile.label, ("profile", profile), is_profile_active(profile, status), shortcut=str(index))
+            for index, profile in enumerate(available_profiles, 1)
+        ]
+        items.extend(
+            [
+                MenuItem("Change model", ("model", None), shortcut="m"),
+                MenuItem("Tools", ("tools", None), shortcut="t"),
+                MenuItem("Diagnostics", ("diagnostics", None), shortcut="d"),
+                MenuItem("Quit", ("quit", None), shortcut="q"),
+            ]
+        )
+
+        def render() -> None:
+            clear_screen()
+            print(header, end="")
+            print(color("Choose mode:", Style.BOLD))
+
+        choice = select_menu(
+            items,
+            render,
+            initial_index=first_active_index(items),
+            cancel_value=("quit", None),
+            help_text="Use arrow keys and Enter. Esc/Q quits.",
+        )
+        kind, value = choice
+        if kind == "quit":
             return
-        if choice == "t":
+        if kind == "tools":
             tools_menu()
             continue
-        if choice == "m":
+        if kind == "model":
             change_model_menu()
             continue
-        if choice == "d":
+        if kind == "diagnostics":
             diagnostics_menu()
             continue
-        try:
-            profile = available_profiles[int(choice) - 1]
-        except Exception:
-            print("Invalid choice.")
-            time.sleep(1)
-            continue
-        apply_profile_menu(profile)
+        apply_profile_menu(value)
 
 
 def main() -> int:

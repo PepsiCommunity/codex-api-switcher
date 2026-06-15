@@ -58,24 +58,34 @@ Write actions are disabled while Codex is running because the desktop app can lo
 
 ## Menu
 
+Menus use arrow-key navigation:
+
 ```text
-1. Subscription / OpenAI account
-2..N. API gateways loaded from apis/*.json
-M. Change model
-T. Tools
-D. Diagnostics
-Q. Quit
+↑/↓ move
+Enter selects
+Esc goes back
+```
+
+Main menu:
+
+```text
+> Subscription / OpenAI account
+  API gateways loaded from apis/*.json
+  Change model
+  Tools
+  Diagnostics
+  Quit
 ```
 
 Tools:
 
 ```text
-A. Add API gateway
-E. Open API gateways folder
-T. Test API gateways
-R. Restore hidden user chats
-S. Sync all chats to current active provider
-Q. Back
+> Add API gateway
+  Open API gateways folder
+  Test API gateways
+  Restore hidden user chats
+  Sync all chats to current active provider
+  Back
 ```
 
 Diagnostics shows the current config, Codex process status, and thread provider counts.
@@ -102,9 +112,9 @@ apis/schema.json
 apis/openai.example.json
 ```
 
-Use `Tools > A. Add API gateway` to create `apis/<gateway-id>.json` from the terminal. It asks for the gateway id, base URL, key mode, API key, context window, then tries to fetch `/models` and stores the selected default model.
+Use `Tools > Add API gateway` to create `apis/<gateway-id>.json` from the terminal. It asks for the gateway id, base URL, key mode, API key, context window, then tries to fetch `/models` and stores the selected default model.
 
-Use `Tools > E. Open API gateways folder` if you prefer editing JSON directly.
+Use `Tools > Open API gateways folder` if you prefer editing JSON directly.
 
 OpenAI API example using the default inline key mode:
 
@@ -159,13 +169,13 @@ The script never prints API keys. Do not commit local `apis/*.json` files.
 
 ## Chat Recovery
 
-`Tools > R. Restore hidden user chats` is the safer recovery action. It updates only user-created chats whose stored provider differs from the current provider. Archived chats are optional.
+`Tools > Restore hidden user chats` is the safer recovery action. It updates only user-created chats whose stored provider differs from the current provider. Archived chats are optional.
 
-`Tools > S. Sync all chats to current active provider` is broader. It updates every local thread row and affected JSONL session to the active provider.
+`Tools > Sync all chats to current active provider` is broader. It updates every local thread row and affected JSONL session to the active provider.
 
 ## Models
 
-`M. Change model` uses the active gateway's `models` list from its local API JSON file and changes only:
+`Change model` uses the active gateway's `models` list from its local API JSON file and changes only:
 
 ```toml
 model = "<selected model>"
@@ -191,7 +201,7 @@ The actual usable context and image support still depend on the selected gateway
 
 ## API Tests
 
-`Tools > T. Test API gateways` can:
+`Tools > Test API gateways` can:
 
 - Fetch live `/models` for a selected gateway.
 - Test a selected model with a text-only `/responses` request.
