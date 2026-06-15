@@ -23,6 +23,7 @@ The script is meant to live next to Codex Desktop config files in `%USERPROFILE%
 codex_provider_menu.cmd   Double-click launcher for Explorer
 codex_provider_menu.py    Main TUI implementation
 codex_provider_menu.ps1   PowerShell compatibility launcher
+requirements.txt          Recommended TUI dependencies
 apis/README.md            Local API config guide
 apis/schema.json          JSON Schema for API configs
 apis/openai.example.json  Copyable OpenAI API example
@@ -38,6 +39,7 @@ apis/
 codex_provider_menu.cmd
 codex_provider_menu.py
 codex_provider_menu.ps1
+requirements.txt
 ```
 
 Installed path example:
@@ -45,6 +47,14 @@ Installed path example:
 ```text
 C:\Users\K\.codex\codex_provider_menu.cmd
 ```
+
+Install the recommended TUI dependencies once:
+
+```powershell
+py -3 -m pip install -r "$env:USERPROFILE\.codex\requirements.txt"
+```
+
+If the dependencies are missing, the script falls back to the built-in stdlib TUI.
 
 ## Run
 
@@ -58,12 +68,13 @@ Write actions are disabled while Codex is running because the desktop app can lo
 
 ## Menu
 
-Menus use arrow-key navigation:
+Menus use Rich + Questionary when installed, with a stdlib fallback. Navigation:
 
 ```text
 ↑/↓ move
 Enter selects
 Esc goes back
+Q goes back/quits
 ```
 
 Main menu:

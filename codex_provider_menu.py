@@ -39,6 +39,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import questionary
+    from questionary import Choice as QuestionaryChoice
+    from questionary import Style as QuestionaryStyle
+    from prompt_toolkit.keys import Keys as PromptKeys
+except Exception:
+    questionary = None
+    QuestionaryChoice = None
+    QuestionaryStyle = None
+    PromptKeys = None
+
+try:
+    from rich.console import Console as RichConsole
+    from rich.text import Text as RichText
+except Exception:
+    RichConsole = None
+    RichText = None
+
 
 APP_TITLE = "Codex Provider Menu"
 TECHNICAL_TITLE_PREFIX = (
@@ -82,12 +100,38 @@ def enable_windows_colors() -> bool:
 
 USE_ANSI = bool(sys.stdout.isatty() and enable_windows_colors())
 USE_COLOR = bool(USE_ANSI and not os.environ.get("NO_COLOR"))
+USE_RICH = bool(RichConsole and RichText and sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
+USE_QUESTIONARY = bool(questionary and QuestionaryChoice and QuestionaryStyle and PromptKeys)
+
+
+QUESTIONARY_STYLE = (
+    QuestionaryStyle(
+        [
+            ("qmark", "fg:#00ffff bold"),
+            ("question", "bold"),
+            ("answer", "fg:#00ff00 bold"),
+            ("pointer", "fg:#00ffff bold"),
+            ("highlighted", "fg:#00ffff bold"),
+            ("instruction", "fg:#888888"),
+            ("text", ""),
+        ]
+    )
+    if QuestionaryStyle
+    else None
+)
 
 
 def color(text: str, *styles: str) -> str:
     if not USE_COLOR or not styles:
         return text
     return "".join(styles) + text + Style.RESET
+
+
+def print_heading(title: str) -> None:
+    if USE_RICH and RichConsole and RichText:
+        RichConsole(file=sys.stdout, highlight=False).print(RichText(title, style="bold cyan"))
+        return
+    print(color(title, Style.CYAN, Style.BOLD))
 
 
 @dataclass(frozen=True)
@@ -740,18 +784,75 @@ def first_active_index(items: list[MenuItem]) -> int:
     return 0
 
 
-def select_menu(
+_QUESTIONARY_UNAVAILABLE = object()
+
+
+def can_use_questionary() -> bool:
+    return bool(USE_QUESTIONARY and sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def select_menu_questionary(
     items: list[MenuItem],
     render_header,
     *,
-    initial_index: int = 0,
-    cancel_value: Any = None,
-    help_text: str = "Use arrow keys and Enter. Esc/Q goes back.",
+    selected: int,
+    cancel_value: Any,
+    help_text: str,
 ) -> Any:
-    if not items:
-        raise ProviderMenuError("Menu has no items.")
+    if not can_use_questionary():
+        return _QUESTIONARY_UNAVAILABLE
 
-    selected = max(0, min(initial_index, len(items) - 1))
+    render_header()
+    choices = [
+        QuestionaryChoice(
+            title=item.label + ("  [active]" if item.active else ""),
+            value=item.value,
+        )
+        for item in items
+    ]
+
+    try:
+        question = questionary.select(
+            "Select",
+            choices=choices,
+            default=items[selected].value,
+            qmark="",
+            pointer=">",
+            style=QUESTIONARY_STYLE,
+            use_shortcuts=False,
+            use_arrow_keys=True,
+            use_jk_keys=False,
+            use_emacs_keys=True,
+            show_selected=False,
+            instruction=f"({help_text})",
+        )
+        if cancel_value is not None:
+            bindings = question.application.key_bindings
+
+            def cancel(event) -> None:
+                event.app.exit(result=cancel_value)
+
+            bindings.add("q", eager=True)(cancel)
+            bindings.add("Q", eager=True)(cancel)
+            bindings.add(PromptKeys.Escape, eager=True)(cancel)
+
+        result = question.ask(kbi_msg="")
+    except Exception:
+        return _QUESTIONARY_UNAVAILABLE
+
+    if result is None and cancel_value is not None:
+        return cancel_value
+    return result
+
+
+def select_menu_builtin(
+    items: list[MenuItem],
+    render_header,
+    *,
+    selected: int,
+    cancel_value: Any,
+    help_text: str,
+) -> Any:
     shortcuts = {item.shortcut.lower(): item.value for item in items if item.shortcut}
     lines = menu_body_lines(items, selected, help_text)
     fast_repaint = can_repaint_menu_body(lines)
@@ -794,6 +895,36 @@ def select_menu(
             else:
                 render_header()
                 print_menu_body(lines)
+
+
+def select_menu(
+    items: list[MenuItem],
+    render_header,
+    *,
+    initial_index: int = 0,
+    cancel_value: Any = None,
+    help_text: str = "Use arrow keys and Enter. Esc/Q goes back.",
+) -> Any:
+    if not items:
+        raise ProviderMenuError("Menu has no items.")
+
+    selected = max(0, min(initial_index, len(items) - 1))
+    choice = select_menu_questionary(
+        items,
+        render_header,
+        selected=selected,
+        cancel_value=cancel_value,
+        help_text=help_text,
+    )
+    if choice is not _QUESTIONARY_UNAVAILABLE:
+        return choice
+    return select_menu_builtin(
+        items,
+        render_header,
+        selected=selected,
+        cancel_value=cancel_value,
+        help_text=help_text,
+    )
 
 
 def display_model_name(model: str) -> str:
@@ -1464,7 +1595,7 @@ def provider_counts() -> list[tuple[str, str, int, int]]:
 
 def show_status(include_thread_providers: bool = False) -> None:
     clear_screen()
-    print(color(APP_TITLE, Style.CYAN, Style.BOLD))
+    print_heading(APP_TITLE)
     print(f"{color('Codex home:', Style.DIM)} {CODEX_HOME}")
     print()
 
@@ -1773,7 +1904,7 @@ def choose_model(models: list[str], prompt: str = "Model", default: str = "") ->
 
     def render() -> None:
         clear_screen()
-        print(color(prompt, Style.CYAN, Style.BOLD))
+        print_heading(prompt)
         if len(models) > len(visible):
             print(color(f"Showing first {len(visible)} of {len(models)} models.", Style.DIM))
         print()
@@ -1834,7 +1965,7 @@ def upsert_api_gateway(entry: dict[str, Any]) -> None:
 
 def add_api_gateway_menu() -> None:
     clear_screen()
-    print(color("Add API Gateway", Style.CYAN, Style.BOLD))
+    print_heading("Add API Gateway")
     print()
     print(f"Config folder: {API_CONFIG_DIR}")
     print("Default key mode stores the API key in the local ignored JSON file.")
@@ -1855,7 +1986,7 @@ def add_api_gateway_menu() -> None:
     if sys.stdin.isatty():
         def render_key_mode() -> None:
             clear_screen()
-            print(color("API key storage", Style.CYAN, Style.BOLD))
+            print_heading("API key storage")
             print(f"Gateway: {name}")
             print(f"Base URL: {base_url}")
             print()
@@ -1966,7 +2097,7 @@ def add_api_gateway_menu() -> None:
 def open_api_config_menu() -> None:
     ensure_api_config_dir()
     clear_screen()
-    print(color("API Gateway Config", Style.CYAN, Style.BOLD))
+    print_heading("API Gateway Config")
     print()
     print(f"Config folder: {API_CONFIG_DIR}")
     print(f"Schema:        {API_SCHEMA_PATH}")
@@ -1996,7 +2127,7 @@ def models_for_test(profile: Profile) -> list[str]:
 
 def test_single_api_menu(profile: Profile) -> None:
     clear_screen()
-    print(color(f"Test API Gateway: {profile.label}", Style.CYAN, Style.BOLD))
+    print_heading(f"Test API Gateway: {profile.label}")
     print()
     print(f"Base URL: {profile.base_url}")
     print(f"Key:      {key_source_label(profile)}")
@@ -2013,7 +2144,7 @@ def test_single_api_menu(profile: Profile) -> None:
     if sys.stdin.isatty():
         def render_test_mode() -> None:
             clear_screen()
-            print(color(f"Test API Gateway: {profile.label}", Style.CYAN, Style.BOLD))
+            print_heading(f"Test API Gateway: {profile.label}")
             print()
             print(f"Base URL: {profile.base_url}")
             print(f"Key:      {key_source_label(profile)}")
@@ -2071,7 +2202,7 @@ def test_apis_menu() -> None:
 
         def render() -> None:
             clear_screen()
-            print(color("API Test", Style.CYAN, Style.BOLD))
+            print_heading("API Test")
             print()
             if not gateways:
                 print(f"No API gateways configured. Add one in Tools > Add API gateway.")
@@ -2149,7 +2280,7 @@ def print_models_result(result: dict[str, Any]) -> None:
 
 def refresh_models_menu() -> None:
     clear_screen()
-    print(color("Available API Models", Style.CYAN, Style.BOLD))
+    print_heading("Available API Models")
     print()
     gateways = api_profiles()
     if not gateways:
@@ -2190,7 +2321,7 @@ def change_model_menu() -> None:
 
         def render() -> None:
             clear_screen()
-            print(color("Change Model", Style.CYAN, Style.BOLD))
+            print_heading("Change Model")
             print()
             print(f"Current gateway: {profile.id if profile else 'unknown'}")
             print(f"Current model:   {current_model}")
@@ -2229,7 +2360,7 @@ def change_model_menu() -> None:
             continue
 
         clear_screen()
-        print(color("Apply model", Style.CYAN, Style.BOLD))
+        print_heading("Apply model")
         print(f"Gateway: {profile.id if profile else 'unknown'}")
         print(f"Current model: {current_model}")
         print(f"Target model:  {selected}")
@@ -2248,7 +2379,7 @@ def change_model_menu() -> None:
 
 def apply_profile_menu(profile: Profile) -> None:
     clear_screen()
-    print(color(f"Apply profile: {profile.label}", Style.CYAN, Style.BOLD))
+    print_heading(f"Apply profile: {profile.label}")
     print(f"Target provider: {profile.provider}")
     if profile.kind == "api":
         print(f"Gateway: {profile.base_url}")
@@ -2271,7 +2402,7 @@ def sync_current_menu() -> None:
     clear_screen()
     status = parse_config_status()
     provider = status.get("model_provider") or ""
-    print(color(f"Sync all chats to current provider: {provider!r}", Style.CYAN, Style.BOLD))
+    print_heading(f"Sync all chats to current provider: {provider!r}")
     print()
     print("Codex Desktop must be closed before applying.")
     print()
@@ -2301,7 +2432,7 @@ def restore_hidden_chats_menu() -> None:
     all_rows = fetch_hidden_user_rows(provider, include_archived=True)
     archived_count = len(all_rows) - len(active_rows)
 
-    print(color("Restore hidden user chats", Style.CYAN, Style.BOLD))
+    print_heading("Restore hidden user chats")
     print()
     print(f"Current provider: {provider}")
     print(f"Active hidden user chats: {len(active_rows)}")
@@ -2362,7 +2493,7 @@ def tools_menu() -> None:
 
         def render() -> None:
             clear_screen()
-            print(color("Tools", Style.CYAN, Style.BOLD))
+            print_heading("Tools")
             print()
 
         choice = select_menu(items, render, cancel_value="back")
