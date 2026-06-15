@@ -1124,42 +1124,6 @@ def apply_model(model: str) -> None:
     print("Restart Codex Desktop before using the new model.")
 
 
-def refresh_model_catalog() -> None:
-    assert_codex_not_running_for_writes()
-    status = parse_config_status()
-    if status.get("model_provider") != "custom":
-        raise ProviderMenuError("Switch to an API gateway profile before refreshing the API model catalog.")
-    gateway_id, _ = models_for_active_profile(status)
-    if not gateway_id:
-        raise ProviderMenuError("Current API gateway is not one of the configured TUI profiles.")
-
-    backup_dir = backup_model_settings()
-    print(f"Backup: {backup_dir}")
-
-    try:
-        write_model_catalog(gateway_id=gateway_id)
-        lines = read_config_lines()
-        lines = set_top_level_value(lines, "model_catalog_json", str(MODEL_CATALOG_PATH))
-        lines = remove_top_level_value(lines, "service_tier")
-        atomic_write_text(CONFIG_PATH, "\n".join(lines) + "\n")
-    except Exception:
-        print("Catalog refresh failed. Restoring backup...")
-        try:
-            restore_model_settings(backup_dir)
-            print("Rollback completed.")
-        except Exception as rollback_error:
-            print(f"Rollback failed: {rollback_error}")
-            print(f"Manual backup: {backup_dir}")
-        raise
-
-    print("API model catalog refreshed.")
-    print(f"Catalog gateway: {gateway_id}")
-    print(f"Context truncation limit: {context_window_for_gateway(gateway_id)}")
-    print(f"Input modalities: {', '.join(MODEL_INPUT_MODALITIES)}")
-    print(f"Model catalog: {MODEL_CATALOG_PATH}")
-    print("Restart Codex Desktop before checking context or image upload.")
-
-
 def provider_counts() -> list[tuple[str, str, int, int]]:
     if not DB_PATH.exists():
         return []
@@ -1601,32 +1565,6 @@ def change_model_menu() -> None:
         pause()
 
 
-def refresh_model_catalog_menu() -> None:
-    clear_screen()
-    status = parse_config_status()
-    gateway_id, models = models_for_active_profile(status)
-    context_window = context_window_for_gateway(gateway_id) if gateway_id else DEFAULT_MODEL_CONTEXT_WINDOW
-    print(color("Refresh API model catalog", Style.CYAN, Style.BOLD))
-    print()
-    print(f"Current provider: {status.get('model_provider') or 'unknown'}")
-    print(f"Current gateway:  {gateway_id or 'unknown'}")
-    print(f"Current model:    {status.get('model') or 'unknown'}")
-    print(f"Catalog models:   {len(models)}")
-    print()
-    print("This rewrites only the generated API model catalog metadata.")
-    print(f"Context truncation limit will be {context_window}.")
-    print(f"Input modalities will be: {', '.join(MODEL_INPUT_MODALITIES)}.")
-    print("Codex Desktop must be closed before applying.")
-    print()
-    try:
-        refresh_model_catalog()
-    except Exception as exc:
-        print()
-        print(f"ERROR: {exc}")
-    print()
-    pause()
-
-
 def apply_profile_menu(profile: Profile) -> None:
     clear_screen()
     print(color(f"Apply profile: {profile.label}", Style.CYAN, Style.BOLD))
@@ -1736,7 +1674,6 @@ def tools_menu() -> None:
         print(color("Tools", Style.CYAN, Style.BOLD))
         print()
         print(format_menu_item("T", "Test API gateways"))
-        print(format_menu_item("C", "Refresh API model catalog"))
         print(format_menu_item("R", "Restore hidden user chats"))
         print(format_menu_item("S", "Sync all chats to current active provider"))
         print(format_menu_item("Q", "Back"))
@@ -1746,9 +1683,6 @@ def tools_menu() -> None:
             return
         if choice == "t":
             test_apis_menu()
-            continue
-        if choice == "c":
-            refresh_model_catalog_menu()
             continue
         if choice == "r":
             restore_hidden_chats_menu()

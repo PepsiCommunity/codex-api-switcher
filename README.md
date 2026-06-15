@@ -11,7 +11,6 @@ The script is meant to live next to Codex Desktop config files in `%USERPROFILE%
 - Keeps local chats visible by syncing thread provider metadata when changing modes.
 - Restores user-created chats hidden under a different provider.
 - Switches API gateway models and writes a Codex model catalog.
-- Refreshes API model catalog metadata for context window and image input.
 - Tests API gateways with text requests and the current gateway with a tiny image.
 - Creates backups before write actions and rolls back on failure where possible.
 - Refuses write actions while `Codex.exe` or `codex.exe` is running.
@@ -67,7 +66,6 @@ Tools:
 
 ```text
 T. Test API gateways
-C. Refresh API model catalog
 R. Restore hidden user chats
 S. Sync all chats to current active provider
 Q. Back
@@ -129,8 +127,6 @@ model_catalog_json = "C:\\Users\\K\\.codex\\codex_provider_models.json"
 It does not modify chat database rows.
 
 In subscription mode the script removes `model_catalog_json` so Codex Desktop can use its built-in model catalog.
-
-`Tools > C. Refresh API model catalog` rewrites the generated catalog without changing chats, provider, or model. Use it after updating this script or when Codex Desktop appears to use an unexpectedly small context or refuses image attachments in API mode.
 
 Generated API model entries are written for the active gateway, not for every configured gateway at once. This matters because the same model slug can exist behind multiple gateways with different limits.
 
